@@ -1,9 +1,9 @@
 //! Shared helpers for UI tests: a controllable clock, a clipboard double, an isolated App harness, and event
 //! and render helpers.
 //!
-//! Editor assertions: `assert_editor_fresh` checks the editor has no content, history, or yank; `assert_editor_settings_match_fresh_app`
-//! compares six settings against a fresh harness. Everything else uses temp-directory vaults and registries with synthetic
-//! secrets. Nothing opens the default vault or registry, touches the desktop clipboard, needs a real terminal, or sleeps.
+//! Everything here uses temp-directory vaults and registries with synthetic secrets. Editor assertions
+//! (`assert_editor_fresh`, `assert_editor_settings_match_fresh_app`) are included in this isolation guarantee.
+//! Nothing opens the default vault or registry, touches the desktop clipboard, needs a real terminal, or sleeps.
 
 use crate::app::{App, Screen};
 use crate::clipboard::ClipboardBackend;

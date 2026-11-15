@@ -3,7 +3,6 @@
 use super::support::{
     Harness, assert_editor_fresh, assert_editor_settings_match_fresh_app, auto_lock, harness, unlock,
 };
-use chamber_vault::AutoLockConfig;
 
 /// Fills the add-item value editor with undo history and yank content, leaving the draft value in place.
 fn fill_editor(h: &mut Harness) {
@@ -14,11 +13,6 @@ fn fill_editor(h: &mut Harness) {
     assert!(editor.insert_str("qqeditorvalue"));
     assert_eq!(editor.yank_text(), "qqeditorcut");
     assert_eq!(editor.lines(), ["qqeditorvalue"]);
-}
-
-#[expect(dead_code)]
-fn disabled_config() -> AutoLockConfig {
-    auto_lock(false, 0)
 }
 
 #[test]
