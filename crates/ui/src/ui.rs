@@ -309,7 +309,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
             KeyCode::Char('c' | 'C') => {
                 // Handle copy operations
                 if matches!(app.screen, Screen::Main) {
-                    app.copy_selected()?;
+                    if let Err(e) = app.copy_selected() {
+                        app.set_status(e.to_string(), StatusType::Error);
+                    }
                 }
                 return Ok(false); // Prevent further processing
             }
@@ -381,7 +383,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
             KeyCode::Char('c') => {
                 // Only handle 'c' for copy if Ctrl is NOT pressed (Ctrl+C handled above)
                 if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                    app.copy_selected()?;
+                    if let Err(e) = app.copy_selected() {
+                        app.set_status(e.to_string(), StatusType::Error);
+                    }
                 }
             }
             KeyCode::Char('v') => {
@@ -547,11 +551,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 app.toggle_value_visibility();
             }
             KeyCode::Char('c') => {
-                if let Some(item) = &app.view_item {
-                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                        let _ = clipboard.set_text(&item.value);
-                        app.set_status(format!("Copied '{}' to clipboard", item.name), StatusType::Success);
-                    }
+                if let Err(e) = app.copy_viewed() {
+                    app.set_status(e.to_string(), StatusType::Error);
                 }
             }
             _ => {}

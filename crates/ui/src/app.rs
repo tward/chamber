@@ -136,6 +136,7 @@ impl AutoLockCallback for TuiAutoLockCallback {
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
+    clipboard: crate::clipboard::Clipboard,
     pub vault: Vault,
     pub vault_manager: VaultManager,
     pub vault_selector: VaultSelector,
@@ -270,6 +271,7 @@ impl App {
         let auto_lock_service = Some(Arc::new(AutoLockService::new(auto_lock_config, callback)));
 
         Ok(Self {
+            clipboard: crate::clipboard::Clipboard::default(),
             vault,
             vault_manager,
             vault_selector,
@@ -751,7 +753,7 @@ impl App {
     ///   returns `Ok(())`.
     ///
     /// - If an item is selected (`get_selected_item` returns `Some`), it:
-    ///   - Initializes a new `arboard::Clipboard` instance.
+    ///   - Lazily initializes and retains the clipboard instance for the TUI lifetime.
     ///   - Copies the `value` of the selected item to the clipboard.
     ///   - Sets a status message indicating that the item has been successfully copied to the clipboard.
     ///
@@ -763,11 +765,20 @@ impl App {
     /// - `set_status`: Updates the application's status message and type.
     ///
     pub fn copy_selected(&mut self) -> Result<()> {
-        if let Some(item) = self.get_selected_item() {
-            let mut clipboard = arboard::Clipboard::new().map_err(|e| eyre!("Failed to access clipboard: {}", e))?;
-            clipboard
-                .set_text(&item.value)
-                .map_err(|e| eyre!("Failed to copy to clipboard: {}", e))?;
+        if let Some(item) = self.filtered_items.get(self.selected) {
+            self.clipboard.set_text(&item.value)?;
+            self.set_status(format!("Copied '{}' to clipboard", item.name), StatusType::Success);
+        }
+        Ok(())
+    }
+
+    /// Copies the item displayed in the detail view, even while its value is hidden.
+    ///
+    /// # Errors
+    /// Returns an error if the desktop clipboard cannot be accessed or written.
+    pub fn copy_viewed(&mut self) -> Result<()> {
+        if let Some(item) = &self.view_item {
+            self.clipboard.set_text(&item.value)?;
             self.set_status(format!("Copied '{}' to clipboard", item.name), StatusType::Success);
         }
         Ok(())
@@ -889,10 +900,7 @@ impl App {
     /// This function makes use of the `arboard` crate for clipboard access and text manipulation.
     pub fn copy_generated_password(&mut self) -> Result<()> {
         if let Some(password) = &self.generated_password {
-            let mut clipboard = arboard::Clipboard::new().map_err(|e| eyre!("Failed to access clipboard: {}", e))?;
-            clipboard
-                .set_text(password)
-                .map_err(|e| eyre!("Failed to copy to clipboard: {}", e))?;
+            self.clipboard.set_text(password)?;
             self.error = Some("Password copied to clipboard".into());
         }
         Ok(())
