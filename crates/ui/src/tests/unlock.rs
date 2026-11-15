@@ -209,7 +209,7 @@ fn unlock_wipes_both_inputs() {
     h.app.master_input = MASTER_PASSWORD.to_string();
     h.app.master_confirm_input = "stray-synthetic-confirm".to_string();
 
-    h.app.unlock();
+    submit(&mut h);
 
     assert_eq!(h.app.screen, Screen::Main);
     assert_inputs_empty(&h);

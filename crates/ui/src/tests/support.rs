@@ -308,7 +308,7 @@ pub(crate) fn harness_with(config: AutoLockConfig, state: VaultState) -> Harness
     }
 }
 
-/// Auto-lock enabled with the given timeout, as the TUI reads it.
+/// Auto-lock configuration builder with the given enabled flag and inactivity timeout, as the TUI reads it.
 pub(crate) const fn auto_lock(enabled: bool, inactivity_timeout_minutes: u64) -> AutoLockConfig {
     AutoLockConfig {
         enabled,
@@ -318,8 +318,6 @@ pub(crate) const fn auto_lock(enabled: bool, inactivity_timeout_minutes: u64) ->
 }
 
 /// Unlocks the App with `MASTER_PASSWORD` through `App::unlock` and asserts it reached the main screen.
-///
-/// Every test reaches `App::unlock` only through this helper.
 pub(crate) fn unlock(app: &mut App) {
     app.master_input = MASTER_PASSWORD.to_string();
     if app.master_mode_is_setup {
