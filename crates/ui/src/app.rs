@@ -412,10 +412,7 @@ impl App {
                 wipe_items(&mut self.items);
                 wipe_items(&mut self.filtered_items);
                 self.items = items;
-                self.update_filtered_items();
-                if self.selected >= self.filtered_items.len() && !self.filtered_items.is_empty() {
-                    self.selected = self.filtered_items.len().saturating_sub(1);
-                }
+                self.refilter_and_clamp_selection();
                 self.error = None;
                 self.status_message = None;
                 self.screen = Screen::Main;
@@ -455,11 +452,15 @@ impl App {
     /// - `Err` with the specific error encountered when listing items from the `vault`.
     pub fn refresh_items(&mut self) -> Result<()> {
         self.items = self.vault.list_items()?;
+        self.refilter_and_clamp_selection();
+        Ok(())
+    }
+
+    fn refilter_and_clamp_selection(&mut self) {
         self.update_filtered_items();
         if self.selected >= self.filtered_items.len() && !self.filtered_items.is_empty() {
             self.selected = self.filtered_items.len().saturating_sub(1);
         }
-        Ok(())
     }
 
     pub fn update_filtered_items(&mut self) {
