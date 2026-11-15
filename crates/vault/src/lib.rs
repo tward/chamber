@@ -422,6 +422,25 @@ impl Vault {
         self.key.is_some()
     }
 
+    /// Locks the vault by dropping the in-memory vault key.
+    ///
+    /// The key is removed from this `Vault` and dropped. `KeyMaterial`'s `Drop` implementation
+    /// zeroizes the key bytes, so no copy of the vault key remains in this value afterward.
+    ///
+    /// This method does not touch the database: the database handle and path are left as they
+    /// are. It takes no password, returns nothing, and cannot fail.
+    ///
+    /// Calling it on a vault that is already locked, or was never unlocked, is a no-op.
+    ///
+    /// The same `Vault` can be unlocked again with [`Vault::unlock`] and the master key.
+    ///
+    /// Locking does not erase decrypted values a caller already holds, such as `Item` values
+    /// returned earlier by [`Vault::list_items`] or [`Vault::get_item_by_name`]. Clearing those
+    /// is the caller's job.
+    pub fn lock(&mut self) {
+        self.key = None;
+    }
+
     /// Retrieves a list of items from the database, decrypting their stored values.
     ///
     /// # Returns
@@ -537,9 +556,14 @@ impl Vault {
     ///
     /// # Errors
     /// This function will return an error if:
+    /// - The vault is locked (no vault key is loaded). This returns `eyre!("Locked")` before the
+    ///   database is touched.
     /// - The item with the specified ID does not exist.
     /// - There is a failure in the underlying database operation.
     pub fn delete_item(&mut self, id: u64) -> Result<()> {
+        if self.key.is_none() {
+            return Err(eyre!("Locked"));
+        }
         self.db.delete_item(id)
     }
 
@@ -1038,6 +1062,104 @@ mod lib_module_tests {
         })?;
 
         assert!(v.get_item_by_name("nope")?.is_none());
+
+        fs::remove_file(path).ok();
+        Ok(())
+    }
+
+    /// Asserts that every item operation on `v` is rejected with the `Locked` error.
+    fn assert_item_ops_locked(v: &mut Vault, existing: &Item) {
+        assert_eq!(v.list_items().unwrap_err().to_string(), "Locked");
+        assert_eq!(v.get_item_by_name(&existing.name).unwrap_err().to_string(), "Locked");
+        let new_item = NewItem {
+            name: "lock-test-new".into(),
+            kind: ItemKind::Note,
+            value: "synthetic-new-value".into(),
+        };
+        assert_eq!(v.create_item(&new_item).unwrap_err().to_string(), "Locked");
+        assert_eq!(
+            v.update_item(existing.id, "synthetic-updated-value")
+                .unwrap_err()
+                .to_string(),
+            "Locked"
+        );
+        assert_eq!(v.delete_item(existing.id).unwrap_err().to_string(), "Locked");
+    }
+
+    #[test]
+    fn test_lock_revokes_access_and_unlock_restores_items() -> Result<()> {
+        let path = tmp_db("lock_revokes");
+        let mut v = Vault::open_or_create(Some(&path))?;
+        v.initialize("lock-master")?;
+        v.unlock("lock-master")?;
+        v.create_item(&NewItem {
+            name: "lock-test-item".into(),
+            kind: ItemKind::Password,
+            value: "synthetic-value".into(),
+        })?;
+
+        let before = v.list_items()?;
+        assert_eq!(before.len(), 1);
+        let recorded = before[0].clone();
+
+        // First lock revokes access to every item operation.
+        v.lock();
+        assert!(!v.is_unlocked());
+        assert_item_ops_locked(&mut v, &recorded);
+
+        // A second lock is a no-op: no panic, still locked, still rejected.
+        v.lock();
+        assert!(!v.is_unlocked());
+        assert_item_ops_locked(&mut v, &recorded);
+
+        // Unlocking again restores the original item, unchanged by the rejected operations.
+        v.unlock("lock-master")?;
+        assert!(v.is_unlocked());
+        let after = v.list_items()?;
+        assert_eq!(after.len(), 1);
+        let item = &after[0];
+        assert_eq!(item.id, recorded.id);
+        assert_eq!(item.name, recorded.name);
+        assert_eq!(item.kind, recorded.kind);
+        assert!(
+            item.value == recorded.value,
+            "item value changed across lock and unlock"
+        );
+        assert_eq!(item.created_at, recorded.created_at);
+        assert_eq!(item.updated_at, recorded.updated_at);
+
+        fs::remove_file(path).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_item_on_locked_vault_fails_before_database() -> Result<()> {
+        let path = tmp_db("lock_delete_missing");
+        let mut v = Vault::open_or_create(Some(&path))?;
+        v.initialize("lock-master")?;
+        v.unlock("lock-master")?;
+        v.lock();
+
+        // An id that does not exist must still report Locked, not a database or not-found error.
+        let err = v.delete_item(u64::MAX).unwrap_err();
+        assert_eq!(err.to_string(), "Locked");
+
+        fs::remove_file(path).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_lock_on_never_unlocked_vault() -> Result<()> {
+        let path = tmp_db("lock_never_unlocked");
+        let mut v = Vault::open_or_create(Some(&path))?;
+        v.initialize("lock-master")?;
+        assert!(!v.is_unlocked());
+
+        v.lock();
+        assert!(!v.is_unlocked());
+
+        v.unlock("lock-master")?;
+        assert!(v.is_unlocked());
 
         fs::remove_file(path).ok();
         Ok(())
