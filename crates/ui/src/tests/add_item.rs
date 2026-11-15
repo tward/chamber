@@ -1,6 +1,8 @@
 //! Tests for the add-item flow: after a successful save the editor is wiped and rebuilt with startup configuration.
 
-use super::support::{Harness, assert_editor_fresh, assert_editor_settings_match_fresh_app, unlock};
+use super::support::{
+    Harness, assert_editor_fresh, assert_editor_settings_match_fresh_app, auto_lock, harness, unlock,
+};
 use chamber_vault::AutoLockConfig;
 
 /// Fills the add-item value editor with undo history and yank content, leaving the draft value in place.
@@ -14,18 +16,14 @@ fn fill_editor(h: &mut Harness) {
     assert_eq!(editor.lines(), ["qqeditorvalue"]);
 }
 
+#[expect(dead_code)]
 fn disabled_config() -> AutoLockConfig {
-    super::support::auto_lock(false, 0)
+    auto_lock(false, 0)
 }
 
 #[test]
 fn ac8_add_item_wipes_editor() {
-    let mut h = Harness {
-        app: super::support::harness(disabled_config()).app,
-        clock: super::support::TestClock::new(),
-        clipboard: super::support::TestClipboard::new(),
-        dir: tempfile::TempDir::new().expect("create temp dir"),
-    };
+    let mut h = harness(auto_lock(false, 0));
 
     unlock(&mut h.app);
     fill_editor(&mut h);

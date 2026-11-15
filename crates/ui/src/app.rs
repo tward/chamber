@@ -652,6 +652,7 @@ impl App {
             Ok(()) => {
                 self.add_name.clear();
                 self.add_value.clear();
+                // Zeroize the saved draft and install a fresh editor configured as at startup.
                 wipe_editor(&mut self.add_value_textarea);
                 self.add_value_scroll = 0;
                 self.refresh_items()?;
