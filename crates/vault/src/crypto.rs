@@ -535,6 +535,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_keymaterial_debug_redacts_key_bytes() {
         let key1_bytes: [u8; 32] = [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
@@ -546,15 +547,20 @@ mod tests {
             201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221,
             222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232,
         ];
-        let _key2 = KeyMaterial(key2_bytes);
+        let key2 = KeyMaterial(key2_bytes);
 
-        let debug_compact = format!("{key1:?}");
-        let debug_pretty = format!("{key1:#?}");
+        let debug_compact_key1 = format!("{key1:?}");
+        let debug_pretty_key1 = format!("{key1:#?}");
+        let debug_compact_key2 = format!("{key2:?}");
+        let debug_pretty_key2 = format!("{key2:#?}");
 
-        assert_eq!(debug_compact, "KeyMaterial(<redacted>)");
-        assert_eq!(debug_pretty, "KeyMaterial(<redacted>)");
+        assert_eq!(debug_compact_key1, "KeyMaterial(<redacted>)");
+        assert_eq!(debug_pretty_key1, "KeyMaterial(<redacted>)");
+        assert_eq!(debug_compact_key2, "KeyMaterial(<redacted>)");
+        assert_eq!(debug_pretty_key2, "KeyMaterial(<redacted>)");
 
-        assert_eq!(debug_compact, debug_pretty);
+        assert_eq!(debug_compact_key1, debug_compact_key2);
+        assert_eq!(debug_pretty_key1, debug_pretty_key2);
 
         let decimal1: String = key1_bytes
             .iter()
@@ -569,39 +575,87 @@ mod tests {
         let hex1 = hex::encode(key1_bytes);
         let hex2 = hex::encode(key2_bytes);
 
-        let output_no_ws = debug_compact.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let output_no_ws_key1 = debug_compact_key1
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
         assert!(
-            !output_no_ws.contains(&decimal1),
+            !output_no_ws_key1.contains(&decimal1),
             "compact output must not contain decimal bytes"
         );
         assert!(
-            !output_no_ws.contains(&decimal2),
+            !output_no_ws_key1.contains(&decimal2),
             "compact output must not contain decimal bytes from other key"
         );
         assert!(
-            !output_no_ws.to_lowercase().contains(&hex1),
+            !output_no_ws_key1.to_lowercase().contains(&hex1),
             "compact output must not contain hex bytes"
         );
         assert!(
-            !output_no_ws.to_lowercase().contains(&hex2),
+            !output_no_ws_key1.to_lowercase().contains(&hex2),
             "compact output must not contain hex bytes from other key"
         );
 
-        let output_no_ws_pretty = debug_pretty.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let output_no_ws_key2 = debug_compact_key2
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
         assert!(
-            !output_no_ws_pretty.contains(&decimal1),
+            !output_no_ws_key2.contains(&decimal1),
+            "compact output must not contain decimal bytes"
+        );
+        assert!(
+            !output_no_ws_key2.contains(&decimal2),
+            "compact output must not contain decimal bytes from other key"
+        );
+        assert!(
+            !output_no_ws_key2.to_lowercase().contains(&hex1),
+            "compact output must not contain hex bytes"
+        );
+        assert!(
+            !output_no_ws_key2.to_lowercase().contains(&hex2),
+            "compact output must not contain hex bytes from other key"
+        );
+
+        let output_no_ws_pretty_key1 = debug_pretty_key1
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+        assert!(
+            !output_no_ws_pretty_key1.contains(&decimal1),
             "pretty output must not contain decimal bytes"
         );
         assert!(
-            !output_no_ws_pretty.contains(&decimal2),
+            !output_no_ws_pretty_key1.contains(&decimal2),
             "pretty output must not contain decimal bytes from other key"
         );
         assert!(
-            !output_no_ws_pretty.to_lowercase().contains(&hex1),
+            !output_no_ws_pretty_key1.to_lowercase().contains(&hex1),
             "pretty output must not contain hex bytes"
         );
         assert!(
-            !output_no_ws_pretty.to_lowercase().contains(&hex2),
+            !output_no_ws_pretty_key1.to_lowercase().contains(&hex2),
+            "pretty output must not contain hex bytes from other key"
+        );
+
+        let output_no_ws_pretty_key2 = debug_pretty_key2
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+        assert!(
+            !output_no_ws_pretty_key2.contains(&decimal1),
+            "pretty output must not contain decimal bytes"
+        );
+        assert!(
+            !output_no_ws_pretty_key2.contains(&decimal2),
+            "pretty output must not contain decimal bytes from other key"
+        );
+        assert!(
+            !output_no_ws_pretty_key2.to_lowercase().contains(&hex1),
+            "pretty output must not contain hex bytes"
+        );
+        assert!(
+            !output_no_ws_pretty_key2.to_lowercase().contains(&hex2),
             "pretty output must not contain hex bytes from other key"
         );
     }
