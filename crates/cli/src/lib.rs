@@ -708,7 +708,7 @@ pub async fn handle_command(cmd: Commands) -> Result<()> {
                 } else {
                     // Interactive mode - show current value (masked for passwords)
                     let display_current = if matches!(item.kind, ItemKind::Password | ItemKind::ApiKey) {
-                        format!("{}***", &item.value.chars().take(3).collect::<String>())
+                        format!("{}***", item.value.chars().take(3).collect::<String>())
                     } else {
                         #[allow(clippy::redundant_clone)]
                         item.value.clone()
@@ -767,8 +767,8 @@ pub async fn handle_command(cmd: Commands) -> Result<()> {
                 println!(
                     "❌ Item '{}' not found{}.",
                     name,
-                    if vault_name.is_some() {
-                        format!(" in vault '{}'", vault_name.unwrap())
+                    if let Some(vault_name) = vault_name {
+                        format!(" in vault '{vault_name}'")
                     } else {
                         " in any vault".to_string()
                     }

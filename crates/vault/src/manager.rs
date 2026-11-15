@@ -732,6 +732,8 @@ mod tests {
         let vault_info = manager.registry.vaults.get(&vault_id).unwrap();
         assert_eq!(vault_info.name, "Imported Vault");
         assert_eq!(vault_info.category, VaultCategory::Archive);
+        // The copy lands next to the registry file, never in the real config directory
+        assert!(vault_info.path.starts_with(temp_dir.path()));
 
         // Store the imported vault file path for cleanup
         let imported_vault_path = vault_info.path.clone();
@@ -964,6 +966,6 @@ mod tests {
         // For now, just test that config creation works
         assert!(config.enabled);
         assert_eq!(config.max_backups, 5);
-        assert!(temp_dir.path().join("backups") == config.backup_dir);
+        assert_eq!(temp_dir.path().join("backups"), config.backup_dir);
     }
 }

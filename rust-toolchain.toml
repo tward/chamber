@@ -1,0 +1,6 @@
+# Pinned because .cargo/config.toml denies all warnings and clippy::pedantic:
+# every new stable release adds lints that would otherwise break the build.
+# To upgrade: bump the version, then fix whatever the gate reports.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

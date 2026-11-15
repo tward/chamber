@@ -45,7 +45,7 @@ impl AuthState {
     /// - The mutex lock is poisoned or cannot be acquired
     #[must_use]
     pub fn is_vault_unlocked(&self) -> bool {
-        self.vault_unlocked.lock().map(|status| *status).unwrap_or(false)
+        self.vault_unlocked.lock().is_ok_and(|status| *status)
     }
 
     /// # Errors

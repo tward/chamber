@@ -456,11 +456,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
             KeyCode::Char('/' | 's') => {
                 app.search_mode = true;
             }
-            KeyCode::Esc => {
-                if !app.search_query.is_empty() {
-                    app.search_query.clear();
-                    app.update_filtered_items();
-                }
+            KeyCode::Esc if !app.search_query.is_empty() => {
+                app.search_query.clear();
+                app.update_filtered_items();
             }
             _ => {}
         },

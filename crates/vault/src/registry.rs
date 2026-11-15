@@ -163,9 +163,15 @@ impl VaultRegistry {
         self.active_vault_id = Some(vault_id);
     }
 
-    fn default_vault_path(vault_id: &str) -> Result<PathBuf> {
-        let base = dirs::config_dir().ok_or_else(|| eyre!("No config directory found"))?;
-        let chamber_dir = base.join("chamber");
+    /// Default location for an additional vault: next to the registry file.
+    /// For a registry loaded with `load` that is the Chamber config directory.
+    fn default_vault_path(&self, vault_id: &str) -> Result<PathBuf> {
+        let chamber_dir = match self.registry_path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => dirs::config_dir()
+                .ok_or_else(|| eyre!("No config directory found"))?
+                .join("chamber"),
+        };
         std::fs::create_dir_all(&chamber_dir)?;
 
         // For additional vaults, use .db extension
@@ -227,7 +233,7 @@ impl VaultRegistry {
         let vault_path = if let Some(custom_path) = path {
             custom_path
         } else {
-            Self::default_vault_path(&vault_id)?
+            self.default_vault_path(&vault_id)?
         };
 
         // Ensure directory exists
@@ -510,7 +516,7 @@ impl VaultRegistry {
         let vault_id = Self::generate_vault_id();
 
         let vault_path = if copy_file {
-            let new_path = Self::default_vault_path(&vault_id)?;
+            let new_path = self.default_vault_path(&vault_id)?;
             if let Some(parent) = new_path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -843,7 +849,7 @@ mod tests {
 
     #[test]
     fn test_create_vault_default_path() {
-        let (mut registry, _temp_dir) = create_temp_registry();
+        let (mut registry, temp_dir) = create_temp_registry();
 
         let result = registry.create_vault("Default Path Vault".to_string(), None, VaultCategory::Work, None);
 
@@ -860,6 +866,8 @@ mod tests {
         assert_eq!(vault.name, "Default Path Vault");
         assert_eq!(vault.category, VaultCategory::Work);
         assert!(vault.description.is_none());
+        // The default location is next to the registry file, never the real config directory
+        assert!(vault.path.starts_with(temp_dir.path()));
     }
 
     #[test]
@@ -1034,6 +1042,8 @@ mod tests {
         assert_eq!(vault.name, "Imported Vault");
         assert_eq!(vault.category, VaultCategory::Project);
         assert_ne!(vault.path, source_file); // Should be copied to a different location
+        // The copy lands next to the registry file, never in the real config directory
+        assert!(vault.path.starts_with(temp_dir.path()));
 
         // Store the copied file path for cleanup
         let copied_file_path = vault.path.clone();

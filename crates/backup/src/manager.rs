@@ -841,7 +841,7 @@ mod tests {
 
         let compressed_path = BackupManager::<MockVault>::compress_backup(&test_file).unwrap();
 
-        assert!(compressed_path.extension().unwrap() == "gz");
+        assert_eq!(compressed_path.extension().unwrap(), "gz");
         assert!(compressed_path.exists());
         assert!(!test_file.exists()); // Original should be removed
 
