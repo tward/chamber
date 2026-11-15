@@ -1,8 +1,9 @@
 //! Shared helpers for UI tests: a controllable clock, a clipboard double, an isolated App harness, and event
 //! and render helpers.
 //!
-//! Everything here uses temp-directory vaults and registries with synthetic secrets. Nothing opens the
-//! default vault or registry, touches the desktop clipboard, needs a real terminal, or sleeps.
+//! Editor assertions: `assert_editor_fresh` checks the editor has no content, history, or yank; `assert_editor_settings_match_fresh_app`
+//! compares six settings against a fresh harness. Everything else uses temp-directory vaults and registries with synthetic
+//! secrets. Nothing opens the default vault or registry, touches the desktop clipboard, needs a real terminal, or sleeps.
 
 use crate::app::{App, Screen};
 use crate::clipboard::ClipboardBackend;
@@ -354,6 +355,30 @@ pub(crate) fn send(h: &mut Harness, event: &Event) -> Result<bool> {
 /// Sends a key press for `code` through `handle_event` with the test clock's current reading.
 pub(crate) fn press(h: &mut Harness, code: KeyCode) -> Result<bool> {
     send(h, &key_press(code))
+}
+
+/// Asserts the editor holds no text, no history, and no yank content, as a freshly built one.
+pub(crate) fn assert_editor_fresh(app: &mut App) {
+    let editor = &mut app.add_value_textarea;
+    assert!(editor.is_empty(), "editor must be empty");
+    assert!(editor.yank_text().is_empty(), "yank buffer must be empty");
+    assert!(!editor.undo(), "undo must change nothing");
+    assert!(!editor.redo(), "redo must change nothing");
+    assert!(!editor.paste(), "paste must insert nothing");
+    assert!(editor.is_empty(), "editor must still be empty");
+}
+
+/// Asserts the six editor settings match those of a freshly built App.
+pub(crate) fn assert_editor_settings_match_fresh_app(app: &App) {
+    let reference = harness(auto_lock(false, 0));
+    let fresh = &reference.app.add_value_textarea;
+    let editor = &app.add_value_textarea;
+    assert_eq!(editor.placeholder_text(), fresh.placeholder_text());
+    assert_eq!(editor.placeholder_style(), fresh.placeholder_style());
+    assert_eq!(editor.line_number_style(), fresh.line_number_style());
+    assert_eq!(editor.cursor_line_style(), fresh.cursor_line_style());
+    assert_eq!(editor.cursor_style(), fresh.cursor_style());
+    assert_eq!(editor.max_histories(), fresh.max_histories());
 }
 
 /// Draws the App into a `TestBackend` of the given size and returns every cell symbol as one string.

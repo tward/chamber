@@ -2,7 +2,10 @@
 //! search text, generated password, editor history, or input mode from the ended session survives, input goes
 //! to the unlock form, and preferences keep their values.
 
-use super::support::{Harness, ITEM_NAME, ITEM_VALUE, auto_lock, harness, press, render, store_item, unlock};
+use super::support::{
+    Harness, ITEM_NAME, ITEM_VALUE, assert_editor_fresh, assert_editor_settings_match_fresh_app, auto_lock, harness,
+    press, render, store_item, unlock,
+};
 use crate::app::{
     AddItemField, App, ChangeKeyField, ImportExportField, ImportExportMode, PasswordGenField, Screen, StatusType,
     UnlockField, ViewMode, new_value_editor, wipe_editor, wipe_item, wipe_items, wipe_optional_string, wipe_string,
@@ -150,17 +153,6 @@ fn fill(h: &mut Harness) -> Vec<(String, String)> {
     app.ie_format_idx = IE_FORMAT_IDX;
 
     stored
-}
-
-/// Asserts the editor holds no text, no history, and no yank content, as a freshly built one.
-fn assert_editor_fresh(app: &mut App) {
-    let editor = &mut app.add_value_textarea;
-    assert!(editor.is_empty(), "editor must be empty");
-    assert!(editor.yank_text().is_empty(), "yank buffer must be empty");
-    assert!(!editor.undo(), "undo must change nothing");
-    assert!(!editor.redo(), "redo must change nothing");
-    assert!(!editor.paste(), "paste must insert nothing");
-    assert!(editor.is_empty(), "editor must still be empty");
 }
 
 /// Asserts every field the lock discards is back to its required state.
@@ -311,16 +303,7 @@ fn unlock_again(mut h: Harness, stored: &[(String, String)]) {
     assert!(h.app.view_item.is_none());
     assert!(h.app.edit_item.is_none());
     assert_editor_fresh(&mut h.app);
-
-    let reference = harness(enabled());
-    let fresh = &reference.app.add_value_textarea;
-    let editor = &h.app.add_value_textarea;
-    assert_eq!(editor.placeholder_text(), fresh.placeholder_text());
-    assert_eq!(editor.placeholder_style(), fresh.placeholder_style());
-    assert_eq!(editor.line_number_style(), fresh.line_number_style());
-    assert_eq!(editor.cursor_line_style(), fresh.cursor_line_style());
-    assert_eq!(editor.cursor_style(), fresh.cursor_style());
-    assert_eq!(editor.max_histories(), fresh.max_histories());
+    assert_editor_settings_match_fresh_app(&h.app);
 
     let frame = render(&mut h.app, WIDTH, HEIGHT);
     for discarded in [

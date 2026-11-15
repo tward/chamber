@@ -652,8 +652,7 @@ impl App {
             Ok(()) => {
                 self.add_name.clear();
                 self.add_value.clear();
-                // Reset the textarea as well
-                self.add_value_textarea = TextArea::default();
+                wipe_editor(&mut self.add_value_textarea);
                 self.add_value_scroll = 0;
                 self.refresh_items()?;
                 self.screen = Screen::Main;
@@ -1565,7 +1564,8 @@ pub(crate) fn wipe_items(items: &mut Vec<Item>) {
 
 /// Builds the add-item value editor exactly as configured at startup.
 ///
-/// Used by `App::with_parts` and by the lock cleanup, so a fresh editor always matches the initial one.
+/// Used by `App::with_parts`, by `App::add_item` after a successful save, and by the lock cleanup, so a
+/// fresh editor always matches the initial one.
 pub(crate) fn new_value_editor() -> TextArea<'static> {
     let mut textarea = TextArea::default();
     // Enable line numbers

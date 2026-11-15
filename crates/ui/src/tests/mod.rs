@@ -1,3 +1,4 @@
+mod add_item;
 mod lock_cleanup;
 mod lock_clipboard;
 mod lock_timer;
