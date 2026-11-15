@@ -10,8 +10,16 @@ use zeroize::Zeroize;
 
 pub type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Clone, Debug)]
+/// A 32-byte key material that implements `Debug` with redacted output
+/// to prevent key bytes from appearing in debug prints.
+#[derive(Clone)]
 pub struct KeyMaterial(pub [u8; 32]);
+impl std::fmt::Debug for KeyMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KeyMaterial(<redacted>)")
+    }
+}
+
 impl KeyMaterial {
     /// Generates a new instance of `Self` with random bytes.
     ///
@@ -524,5 +532,77 @@ mod tests {
         pub fn encode<T: AsRef<[u8]>>(data: T) -> String {
             data.as_ref().iter().map(|b| format!("{b:02x}")).collect()
         }
+    }
+
+    #[test]
+    fn test_keymaterial_debug_redacts_key_bytes() {
+        let key1_bytes: [u8; 32] = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+            30, 31, 32,
+        ];
+        let key1 = KeyMaterial(key1_bytes);
+
+        let key2_bytes: [u8; 32] = [
+            201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221,
+            222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232,
+        ];
+        let _key2 = KeyMaterial(key2_bytes);
+
+        let debug_compact = format!("{key1:?}");
+        let debug_pretty = format!("{key1:#?}");
+
+        assert_eq!(debug_compact, "KeyMaterial(<redacted>)");
+        assert_eq!(debug_pretty, "KeyMaterial(<redacted>)");
+
+        assert_eq!(debug_compact, debug_pretty);
+
+        let decimal1: String = key1_bytes
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let decimal2: String = key2_bytes
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let hex1 = hex::encode(key1_bytes);
+        let hex2 = hex::encode(key2_bytes);
+
+        let output_no_ws = debug_compact.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        assert!(
+            !output_no_ws.contains(&decimal1),
+            "compact output must not contain decimal bytes"
+        );
+        assert!(
+            !output_no_ws.contains(&decimal2),
+            "compact output must not contain decimal bytes from other key"
+        );
+        assert!(
+            !output_no_ws.to_lowercase().contains(&hex1),
+            "compact output must not contain hex bytes"
+        );
+        assert!(
+            !output_no_ws.to_lowercase().contains(&hex2),
+            "compact output must not contain hex bytes from other key"
+        );
+
+        let output_no_ws_pretty = debug_pretty.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        assert!(
+            !output_no_ws_pretty.contains(&decimal1),
+            "pretty output must not contain decimal bytes"
+        );
+        assert!(
+            !output_no_ws_pretty.contains(&decimal2),
+            "pretty output must not contain decimal bytes from other key"
+        );
+        assert!(
+            !output_no_ws_pretty.to_lowercase().contains(&hex1),
+            "pretty output must not contain hex bytes"
+        );
+        assert!(
+            !output_no_ws_pretty.to_lowercase().contains(&hex2),
+            "pretty output must not contain hex bytes from other key"
+        );
     }
 }

@@ -861,6 +861,7 @@ mod lib_module_tests {
     #![allow(clippy::panic_in_result_fn)]
     #![allow(clippy::expect_used)]
     use super::*;
+    use std::fmt::Write;
     use std::fs;
     use std::str::FromStr;
 
@@ -1270,6 +1271,69 @@ mod lib_module_tests {
         assert!(reopened.is_initialized());
         reopened.unlock("")?;
         assert!(reopened.is_unlocked());
+        Ok(())
+    }
+
+    fn hex_encode(data: &[u8]) -> String {
+        let mut s = String::with_capacity(64);
+        for b in data {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    #[test]
+    fn test_vault_debug_redacts_key_material() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("vault_debug.db");
+
+        let mut v = Vault::open_or_create(Some(&path))?;
+        v.initialize("test-master")?;
+        v.unlock("test-master")?;
+
+        assert!(v.key.is_some(), "vault must be unlocked to test key formatting");
+
+        let debug_compact = format!("{v:?}");
+        let debug_pretty = format!("{v:#?}");
+
+        assert!(
+            debug_compact.contains("KeyMaterial(<redacted>)"),
+            "compact must show redacted key placeholder"
+        );
+        assert!(
+            debug_pretty.contains("KeyMaterial(<redacted>)"),
+            "pretty must show redacted key placeholder"
+        );
+
+        let key_bytes = v.key.as_ref().expect("unlocked").0;
+        let decimal: String = key_bytes
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let hex = hex_encode(&key_bytes);
+
+        let output_no_ws = debug_compact.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        assert!(
+            !output_no_ws.contains(&decimal),
+            "compact output must not contain decimal bytes"
+        );
+        assert!(
+            !output_no_ws.to_lowercase().contains(&hex),
+            "compact output must not contain hex bytes"
+        );
+
+        let output_no_ws_pretty = debug_pretty.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        assert!(
+            !output_no_ws_pretty.contains(&decimal),
+            "pretty output must not contain decimal bytes"
+        );
+        assert!(
+            !output_no_ws_pretty.to_lowercase().contains(&hex),
+            "pretty output must not contain hex bytes"
+        );
+
+        dir.close()?;
         Ok(())
     }
 }
