@@ -26,8 +26,9 @@ pub(crate) trait ClipboardBackend {
     fn release(&mut self);
 }
 
-/// Keeps ownership of copied text for the lifetime of the TUI on Linux.
-/// Initialize lazily so a missing desktop clipboard does not prevent startup.
+/// Lazily creates the desktop clipboard handle on first use, so a missing clipboard does not prevent startup.
+/// Keeps the handle until the session locks, at which point `ClipboardBackend::release` clears it.
+/// The next copy operation recreates the handle.
 #[derive(Default)]
 pub(crate) struct Clipboard {
     inner: Option<arboard::Clipboard>,

@@ -776,7 +776,8 @@ impl App {
     ///   returns `Ok(())`.
     ///
     /// - If an item is selected (`get_selected_item` returns `Some`), it:
-    ///   - Lazily initializes and retains the clipboard instance for the TUI lifetime.
+    ///   - Lazily initializes the desktop clipboard handle on first use, keeps it until the session locks,
+    ///     and recreates it on the first copy after a lock.
     ///   - Copies the `value` of the selected item to the clipboard and remembers its digest, so `lock`
     ///     can clear it if it is still there.
     ///   - Sets a status message indicating that the item has been successfully copied to the clipboard.
@@ -1203,10 +1204,8 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - Switching to a vault fails.
-    /// - The requested vault action encounters an issue (e.g., file access issues during imports or
-    ///   failures in vault creation/deletion).
+    /// Returns an error if switching to a vault fails. Other actions (`Create`, `Update`, `Delete`,
+    /// `Import`, `Refresh`, `Close`, `ShowHelp`) report failures through the UI and return `Ok(())`.
     pub fn handle_vault_action(&mut self, action: VaultAction) -> Result<()> {
         match action {
             VaultAction::Switch(vault_id) => {

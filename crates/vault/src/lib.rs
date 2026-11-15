@@ -561,7 +561,7 @@ impl Vault {
     /// Deletes an item from the database with the specified ID.
     ///
     /// # Parameters
-    /// - `id` (i64): The unique identifier of the item to be deleted.
+    /// - `id` (u64): The unique identifier of the item to be deleted.
     ///
     /// # Returns
     /// - `Result<()>`: Returns `Ok(())` if the item is successfully deleted, or an error if the deletion fails.
@@ -570,7 +570,6 @@ impl Vault {
     /// This function will return an error if:
     /// - The vault is locked (no vault key is loaded). This returns `eyre!("Locked")` before the
     ///   database is touched.
-    /// - The item with the specified ID does not exist.
     /// - There is a failure in the underlying database operation.
     pub fn delete_item(&mut self, id: u64) -> Result<()> {
         if self.key.is_none() {
