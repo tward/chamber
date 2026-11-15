@@ -456,6 +456,7 @@ impl App {
         Ok(())
     }
 
+    /// Re-runs the item filter, then clamps `selected` to the last index of a non-empty `filtered_items`.
     fn refilter_and_clamp_selection(&mut self) {
         self.update_filtered_items();
         if self.selected >= self.filtered_items.len() && !self.filtered_items.is_empty() {
