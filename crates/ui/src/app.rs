@@ -124,7 +124,7 @@ pub struct CountdownInfo {
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
-    clipboard: crate::clipboard::Clipboard,
+    clipboard: crate::clipboard::SessionClipboard,
     pub vault: Vault,
     pub vault_manager: VaultManager,
     pub vault_selector: VaultSelector,
@@ -255,7 +255,7 @@ impl App {
             vault_manager,
             AutoLockConfig::default(),
             Box::new(SystemClock::new()),
-            crate::clipboard::Clipboard::default(),
+            Box::new(crate::clipboard::Clipboard::default()),
         ))
     }
 
@@ -267,14 +267,14 @@ impl App {
         vault_manager: VaultManager,
         auto_lock_config: AutoLockConfig,
         clock: Box<dyn Clock>,
-        clipboard: crate::clipboard::Clipboard,
+        clipboard: Box<dyn crate::clipboard::ClipboardBackend>,
     ) -> Self {
         let vault_selector = VaultSelector::new();
         // Setup mode (create master password) when the vault has no master key yet.
         let master_mode_is_setup = !vault.is_initialized();
 
         Self {
-            clipboard,
+            clipboard: crate::clipboard::SessionClipboard::new(clipboard),
             vault,
             vault_manager,
             vault_selector,
@@ -769,7 +769,8 @@ impl App {
     ///
     /// - If an item is selected (`get_selected_item` returns `Some`), it:
     ///   - Lazily initializes and retains the clipboard instance for the TUI lifetime.
-    ///   - Copies the `value` of the selected item to the clipboard.
+    ///   - Copies the `value` of the selected item to the clipboard and remembers its digest, so `lock`
+    ///     can clear it if it is still there.
     ///   - Sets a status message indicating that the item has been successfully copied to the clipboard.
     ///
     /// # Dependencies
@@ -781,7 +782,7 @@ impl App {
     ///
     pub fn copy_selected(&mut self) -> Result<()> {
         if let Some(item) = self.filtered_items.get(self.selected) {
-            self.clipboard.set_text(&item.value)?;
+            self.clipboard.copy(&item.value)?;
             self.set_status(format!("Copied '{}' to clipboard", item.name), StatusType::Success);
         }
         Ok(())
@@ -793,7 +794,7 @@ impl App {
     /// Returns an error if the desktop clipboard cannot be accessed or written.
     pub fn copy_viewed(&mut self) -> Result<()> {
         if let Some(item) = &self.view_item {
-            self.clipboard.set_text(&item.value)?;
+            self.clipboard.copy(&item.value)?;
             self.set_status(format!("Copied '{}' to clipboard", item.name), StatusType::Success);
         }
         Ok(())
@@ -915,7 +916,7 @@ impl App {
     /// This function makes use of the `arboard` crate for clipboard access and text manipulation.
     pub fn copy_generated_password(&mut self) -> Result<()> {
         if let Some(password) = &self.generated_password {
-            self.clipboard.set_text(password)?;
+            self.clipboard.copy(password)?;
             self.error = Some("Password copied to clipboard".into());
         }
         Ok(())
@@ -1461,9 +1462,18 @@ impl App {
     ///
     /// Does nothing when already locked, so a password being typed on the unlock form is never erased.
     /// Otherwise, in this order: drops the vault key, closes every vault the manager holds open, stops the
-    /// inactivity timer, discards the ended session's state (see below), sets the status to
-    /// "Locked due to inactivity", and returns to the unlock screen. The registry and the vault's database
-    /// path are untouched, so the same vault can be unlocked again.
+    /// inactivity timer, discards the ended session's state (see below), clears the clipboard if it still
+    /// holds the value this session last copied, sets the status to "Locked due to inactivity", and returns
+    /// to the unlock screen. The registry and the vault's database path are untouched, so the same vault can
+    /// be unlocked again.
+    ///
+    /// Clipboard step: when nothing was copied this session, the clipboard is not read, cleared, or even
+    /// opened. Otherwise it is read and cleared only if its text has the SHA-256 digest of the last copied
+    /// value, or if it cannot be read at all; different text or no text is left alone. Either way the stored
+    /// digest is zeroized and removed and the retained clipboard handle is released. A failed clear changes
+    /// the status to "Locked due to inactivity. Clipboard could not be cleared." as a warning, and never
+    /// stops the rest of the lock. Copies that clipboard managers or other applications already took are
+    /// out of reach.
     ///
     /// The lock always completes, whatever screen or dialog is open. Unsaved edits and drafts are discarded
     /// without saving or prompting. After a lock, no live application state can show, restore, or receive
@@ -1499,8 +1509,21 @@ impl App {
         self.last_activity = None;
         self.countdown_info = None;
         self.discard_session_state();
-        self.set_status("Locked due to inactivity".to_string(), StatusType::Info);
+        if self.clipboard.clear_at_lock() {
+            self.set_status(
+                "Locked due to inactivity. Clipboard could not be cleared.".to_string(),
+                StatusType::Warning,
+            );
+        } else {
+            self.set_status("Locked due to inactivity".to_string(), StatusType::Info);
+        }
         self.screen = Screen::Unlock;
+    }
+
+    /// Whether the session clipboard holds the digest of a copied value.
+    #[cfg(test)]
+    pub(crate) const fn clipboard_digest_stored(&self) -> bool {
+        self.clipboard.has_digest()
     }
 
     /// Wipes and resets everything `lock` discards. See `lock` for the list.

@@ -25,6 +25,7 @@ color-eyre = {workspace = true}
 async-trait = {workspace = true}
 chrono = {workspace = true}
 zeroize = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

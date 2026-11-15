@@ -1,18 +1,19 @@
-//! Shared helpers for UI tests: a controllable clock, an isolated App harness, and event and render helpers.
+//! Shared helpers for UI tests: a controllable clock, a clipboard double, an isolated App harness, and event
+//! and render helpers.
 //!
 //! Everything here uses temp-directory vaults and registries with synthetic secrets. Nothing opens the
 //! default vault or registry, touches the desktop clipboard, needs a real terminal, or sleeps.
 
 use crate::app::{App, Screen};
-use crate::clipboard::Clipboard;
+use crate::clipboard::ClipboardBackend;
 use crate::clock::{Clock, ClockReading};
 use crate::ui::{draw, handle_event};
 use chamber_vault::{AutoLockConfig, ItemKind, NewItem, Vault, VaultManager, VaultRegistry};
-use color_eyre::Result;
+use color_eyre::{Result, eyre::eyre};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -88,12 +89,155 @@ impl Clock for TestClock {
     }
 }
 
-/// An App built from isolated parts, the handle to its clock, and the temp directory holding its files.
+/// A call the App made on the clipboard double. `release` calls are counted separately.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClipboardCall {
+    SetText(String),
+    ReadText,
+    Clear,
+}
+
+/// How the clipboard double answers `read_text`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadBehavior {
+    /// Returns the simulated content: its text, or no text when empty.
+    Content,
+    /// Reports that the clipboard holds no text, whatever the simulated content.
+    NoText,
+    /// Fails with an error other than "no text".
+    Fail,
+}
+
+struct TestClipboardState {
+    content: Option<String>,
+    calls: Vec<ClipboardCall>,
+    releases: usize,
+    read: ReadBehavior,
+    fail_set_text: bool,
+    fail_clear: bool,
+}
+
+/// A clipboard double. Clones share state, so the handle a test keeps sees and steers the one the App uses.
+#[derive(Clone)]
+pub(crate) struct TestClipboard {
+    state: Rc<RefCell<TestClipboardState>>,
+}
+
+impl TestClipboard {
+    /// An empty clipboard that records calls and succeeds at everything.
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Rc::new(RefCell::new(TestClipboardState {
+                content: None,
+                calls: Vec::new(),
+                releases: 0,
+                read: ReadBehavior::Content,
+                fail_set_text: false,
+                fail_clear: false,
+            })),
+        }
+    }
+
+    /// The simulated clipboard content.
+    pub(crate) fn content(&self) -> Option<String> {
+        self.state.borrow().content.clone()
+    }
+
+    /// Replaces the content from outside the App, as another application taking the clipboard would.
+    /// Not recorded as a call.
+    pub(crate) fn replace_externally(&self, content: Option<&str>) {
+        self.state.borrow_mut().content = content.map(str::to_string);
+    }
+
+    /// Every `set_text`, `read_text`, and `clear` call so far, in order.
+    pub(crate) fn calls(&self) -> Vec<ClipboardCall> {
+        self.state.borrow().calls.clone()
+    }
+
+    /// Number of `set_text` calls so far.
+    pub(crate) fn set_text_calls(&self) -> usize {
+        self.count(|c| matches!(c, ClipboardCall::SetText(_)))
+    }
+
+    /// Number of `read_text` calls so far.
+    pub(crate) fn read_calls(&self) -> usize {
+        self.count(|c| *c == ClipboardCall::ReadText)
+    }
+
+    /// Number of `clear` calls so far.
+    pub(crate) fn clear_calls(&self) -> usize {
+        self.count(|c| *c == ClipboardCall::Clear)
+    }
+
+    /// Number of `release` calls so far.
+    pub(crate) fn releases(&self) -> usize {
+        self.state.borrow().releases
+    }
+
+    /// Sets how `read_text` answers.
+    pub(crate) fn set_read_behavior(&self, read: ReadBehavior) {
+        self.state.borrow_mut().read = read;
+    }
+
+    /// Makes `set_text` fail (without changing the content) or succeed.
+    pub(crate) fn set_fail_set_text(&self, fail: bool) {
+        self.state.borrow_mut().fail_set_text = fail;
+    }
+
+    /// Makes `clear` fail (without changing the content) or succeed.
+    pub(crate) fn set_fail_clear(&self, fail: bool) {
+        self.state.borrow_mut().fail_clear = fail;
+    }
+
+    fn count(&self, pred: impl Fn(&ClipboardCall) -> bool) -> usize {
+        self.state.borrow().calls.iter().filter(|c| pred(c)).count()
+    }
+}
+
+impl ClipboardBackend for TestClipboard {
+    fn set_text(&mut self, text: &str) -> Result<()> {
+        let mut state = self.state.borrow_mut();
+        state.calls.push(ClipboardCall::SetText(text.to_string()));
+        if state.fail_set_text {
+            return Err(eyre!("Failed to copy to clipboard: simulated failure"));
+        }
+        state.content = Some(text.to_string());
+        Ok(())
+    }
+
+    fn read_text(&mut self) -> Result<Option<String>> {
+        let mut state = self.state.borrow_mut();
+        state.calls.push(ClipboardCall::ReadText);
+        match state.read {
+            ReadBehavior::Content => Ok(state.content.clone()),
+            ReadBehavior::NoText => Ok(None),
+            ReadBehavior::Fail => Err(eyre!("Failed to read clipboard: simulated failure")),
+        }
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        let mut state = self.state.borrow_mut();
+        state.calls.push(ClipboardCall::Clear);
+        if state.fail_clear {
+            return Err(eyre!("Failed to clear clipboard: simulated failure"));
+        }
+        state.content = None;
+        Ok(())
+    }
+
+    fn release(&mut self) {
+        self.state.borrow_mut().releases += 1;
+    }
+}
+
+/// An App built from isolated parts, the handles to its clock and clipboard, and the temp directory holding
+/// its files.
 ///
 /// Fields drop in declaration order, so the App closes its databases before the directory is removed.
 pub(crate) struct Harness {
     pub(crate) app: App,
     pub(crate) clock: TestClock,
+    pub(crate) clipboard: TestClipboard,
     pub(crate) dir: TempDir,
 }
 
@@ -147,14 +291,20 @@ pub(crate) fn harness_with(config: AutoLockConfig, state: VaultState) -> Harness
     };
 
     let clock = TestClock::new();
+    let clipboard = TestClipboard::new();
     let app = App::with_parts(
         vault,
         vault_manager,
         config,
         Box::new(clock.clone()),
-        Clipboard::default(),
+        Box::new(clipboard.clone()),
     );
-    Harness { app, clock, dir }
+    Harness {
+        app,
+        clock,
+        clipboard,
+        dir,
+    }
 }
 
 /// Auto-lock enabled with the given timeout, as the TUI reads it.
