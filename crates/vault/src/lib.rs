@@ -335,18 +335,25 @@ impl Vault {
     /// initialized already. It generates a vault key that is securely wrapped using the
     /// derived master key, and then stores the necessary metadata in the database.
     ///
+    /// An empty master key is always refused, even when the vault is already initialized.
+    /// Only an empty string is refused: whitespace is not trimmed and no other password rule
+    /// is applied here.
+    ///
     /// # Parameters
     /// - `master`: A reference to a string slice representing the master key. This key is
-    ///   used as the input to derive a secure key for wrapping the vault key.
+    ///   used as the input to derive a secure key for wrapping the vault key. It must not be
+    ///   empty.
     ///
     /// # Returns
     /// - `Ok(())`: If the storage is successfully initialized or was already initialized.
-    /// - `Err`: If any step in the initialization process fails (e.g., key derivation,
-    ///   key wrapping, or database write).
+    /// - `Err`: If `master` is empty, or if any step in the initialization process fails
+    ///   (e.g., key derivation, key wrapping, or database write).
     ///
     /// # Implementation Details
-    /// - First, the function checks whether the storage system has already been initialized
-    ///   using the `is_initialized()` method. If true, it immediately returns `Ok(())`.
+    /// - First, the function refuses an empty `master` before doing anything else, so a
+    ///   refused call writes nothing.
+    /// - Next, it checks whether the storage system has already been initialized using the
+    ///   `is_initialized()` method. If true, it immediately returns `Ok(())`.
     /// - The function then generates secure key derivation parameters (`KdfParams`) using
     ///   `KdfParams::default_secure()`.
     /// - Using the provided master key and the key derivation parameters, a derived key
@@ -360,11 +367,16 @@ impl Vault {
     ///
     /// # Errors
     /// - Fails with an error if:
+    ///   - `master` is empty. The error text is "Master password cannot be empty", and the
+    ///     database is left unchanged.
     ///   - The master key derivation fails.
     ///   - The vault key wrapping fails.
     ///   - Writing the required metadata to the database fails.
     /// - Errors are returned as a `Result::Err`, allowing the caller to handle the failure.
     pub fn initialize(&mut self, master: &str) -> Result<()> {
+        if master.is_empty() {
+            return Err(eyre!("Master password cannot be empty"));
+        }
         if self.is_initialized() {
             return Ok(());
         }
@@ -719,15 +731,20 @@ impl Vault {
     /// - `category`: An instance of `VaultCategory` indicating the category for the vault (e.g., Personal, Business).
     /// - `description`: An optional description providing additional details about the vault.
     /// - `master_password`: A reference to a string containing the master password used for securing the vault.
+    ///   It must not be empty.
     ///
     /// # Returns
     /// - `Ok((String, Self))`: Returns a tuple containing:
     ///     - `String`: The unique ID of the newly created vault.
     ///     - `Self`: The newly initialized vault instance.
-    /// - `Err(_)`: Returns an error if the vault creation or initialization process fails.
+    /// - `Err(_)`: Returns an error if the password is empty, or if the vault creation or initialization
+    ///   process fails.
     ///
     /// # Errors
     /// This function may return an error in the following cases:
+    /// - If `master_password` is empty. The error text is "Master password cannot be empty". This check runs
+    ///   before the registry is loaded, so a refused call reads and writes nothing: no registry entry and no
+    ///   vault file. Only an empty string is refused; whitespace is not trimmed.
     /// - If the `VaultRegistry` fails to load.
     /// - If the vault cannot be created in the registry (e.g., due to duplicate names or invalid paths).
     /// - If the vault cannot be opened or initialized (e.g., due to issues with the provided path or master password).
@@ -745,6 +762,9 @@ impl Vault {
         description: Option<String>,
         master_password: &str,
     ) -> Result<(String, Self)> {
+        if master_password.is_empty() {
+            return Err(eyre!("Master password cannot be empty"));
+        }
         let mut registry = VaultRegistry::load()?;
         let vault_id = registry.create_vault(name, path, category, description)?;
 
@@ -1162,6 +1182,94 @@ mod lib_module_tests {
         assert!(v.is_unlocked());
 
         fs::remove_file(path).ok();
+        Ok(())
+    }
+
+    const EMPTY_PASSWORD_ERROR: &str = "Master password cannot be empty";
+
+    /// Sorted names of the entries directly inside `dir`.
+    fn dir_listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Writes vault metadata for an empty master password straight to the database, the way older
+    /// versions could, without going through `initialize`.
+    fn write_empty_password_meta(v: &Vault) -> Result<()> {
+        let kdf = KdfParams::default_secure();
+        let master_derived = derive_key("", &kdf)?;
+        let vault_key = KeyMaterial::random();
+        let (wrapped, verifier) = wrap_vault_key(&master_derived, &vault_key)?;
+        v.db.write_meta(&kdf, &wrapped, &verifier)
+    }
+
+    #[test]
+    fn test_initialize_refuses_empty_password_on_new_vault() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let mut v = Vault::open_or_create(Some(&dir.path().join("vault.db")))?;
+
+        let err = v.initialize("").unwrap_err();
+        assert_eq!(err.to_string(), EMPTY_PASSWORD_ERROR);
+        assert!(!v.is_initialized());
+        Ok(())
+    }
+
+    #[test]
+    fn test_initialize_refuses_empty_password_on_initialized_vault() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("vault.db");
+        let mut v = Vault::open_or_create(Some(&path))?;
+        v.initialize("original-master")?;
+
+        let err = v.initialize("").unwrap_err();
+        assert_eq!(err.to_string(), EMPTY_PASSWORD_ERROR);
+        assert!(v.is_initialized());
+
+        let mut reopened = Vault::open_or_create(Some(&path))?;
+        reopened.unlock("original-master")?;
+        assert!(reopened.is_unlocked());
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_new_vault_refuses_empty_password_before_touching_anything() -> Result<()> {
+        // The empty-password check is the first statement, so this call returns before the real
+        // registry is loaded.
+        let dir = tempfile::TempDir::new()?;
+        let requested = dir.path().join("refused.db");
+        let before = dir_listing(dir.path());
+
+        let err = Vault::create_new_vault(
+            "refused".to_string(),
+            Some(requested.clone()),
+            VaultCategory::Personal,
+            None,
+            "",
+        )
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), EMPTY_PASSWORD_ERROR);
+        assert!(!requested.exists());
+        assert_eq!(dir_listing(dir.path()), before);
+        Ok(())
+    }
+
+    #[test]
+    fn test_existing_empty_password_vault_still_unlocks() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("legacy.db");
+        let v = Vault::open_or_create(Some(&path))?;
+        write_empty_password_meta(&v)?;
+        drop(v);
+
+        let mut reopened = Vault::open_or_create(Some(&path))?;
+        assert!(reopened.is_initialized());
+        reopened.unlock("")?;
+        assert!(reopened.is_unlocked());
         Ok(())
     }
 }

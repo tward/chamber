@@ -51,16 +51,20 @@ impl VaultManager {
     /// * `category` - A `VaultCategory` enum indicating the category or use case associated with this vault (e.g., personal, business).
     /// * `description` - An optional `String` for providing additional details or metadata about the vault.
     /// * `master_password` - A reference to a `str` that will be used to secure the freshly created vault. This master password is required for future vault access.
+    ///   It must not be empty.
     ///
     /// # Returns
     ///
     /// Returns a `Result<String>`:
     /// * `Ok(String)` - The unique identifier (vault ID) of the newly created vault on successful creation and initialization.
-    /// * `Err` - An error is returned if vault creation, retrieval, or initialization fails.
+    /// * `Err` - An error is returned if the password is empty, or if vault creation, retrieval, or initialization fails.
     ///
     /// # Errors
     ///
     /// This function may return an error in the following scenarios:
+    /// * If `master_password` is empty. The error text is "Master password cannot be empty". This check runs before the
+    ///   registry is touched, so a refused call leaves no registry entry, writes no registry file, and creates no vault
+    ///   file. Only an empty string is refused; whitespace is not trimmed.
     /// * If the vault could not be successfully created in the registry.
     /// * If the vault information retrieval process encounters an issue.
     /// * If the vault initialization process fails (e.g., due to encryption setup or invalid master password).
@@ -86,6 +90,9 @@ impl VaultManager {
         description: Option<String>,
         master_password: &str,
     ) -> Result<String> {
+        if master_password.is_empty() {
+            return Err(eyre!("Master password cannot be empty"));
+        }
         let vault_id = self.registry.create_vault(name, path, category, description)?;
 
         // Initialize the new vault
@@ -934,6 +941,82 @@ mod tests {
         assert!(manager.close_vault("nonexistent").is_ok());
         assert!(!manager.is_vault_open("nonexistent"));
         assert!(manager.get_vault("nonexistent").is_none());
+    }
+
+    /// Sorted paths, relative to `root`, of every file and directory below it.
+    fn tree_listing(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                out.push(path.strip_prefix(root).unwrap().to_path_buf());
+                if path.is_dir() {
+                    walk(root, &path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// Sorted (id, name, path) of every registry entry.
+    fn registry_entries(manager: &VaultManager) -> Vec<(String, String, std::path::PathBuf)> {
+        let mut entries: Vec<_> = manager
+            .registry
+            .vaults
+            .iter()
+            .map(|(id, info)| (id.clone(), info.name.clone(), info.path.clone()))
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn test_create_vault_refuses_empty_password_without_touching_registry_or_disk() {
+        let (mut manager, temp_dir) = create_isolated_vault_manager();
+        let existing = create_test_vault_info("existing", "Existing Vault", VaultCategory::Personal, &temp_dir);
+        manager.registry.vaults.insert("existing".to_string(), existing);
+
+        let entries_before = registry_entries(&manager);
+        let listing_before = tree_listing(temp_dir.path());
+        let explicit_path = temp_dir.path().join("vaults").join("refused.db");
+
+        for path in [Some(explicit_path.clone()), None] {
+            let err = manager
+                .create_vault("Refused".to_string(), path, VaultCategory::Personal, None, "")
+                .unwrap_err();
+            assert_eq!(err.to_string(), "Master password cannot be empty");
+        }
+
+        assert_eq!(registry_entries(&manager), entries_before);
+        assert!(
+            !manager.registry.registry_path.exists(),
+            "no registry file may be written"
+        );
+        assert!(!explicit_path.exists());
+        assert_eq!(tree_listing(temp_dir.path()), listing_before);
+    }
+
+    #[test]
+    fn test_open_vault_unlocks_existing_empty_password_vault() -> Result<()> {
+        let (mut manager, temp_dir) = create_isolated_vault_manager();
+        let info = create_test_vault_info("legacy", "legacy", VaultCategory::Personal, &temp_dir);
+
+        // Write empty-password metadata directly, as older versions could, without `initialize`.
+        let vault = Vault::open_or_create(Some(&info.path))?;
+        let kdf = crate::KdfParams::default_secure();
+        let master_derived = crate::derive_key("", &kdf)?;
+        let (wrapped, verifier) = crate::wrap_vault_key(&master_derived, &crate::KeyMaterial::random())?;
+        vault.db.write_meta(&kdf, &wrapped, &verifier)?;
+        drop(vault);
+
+        manager.registry.vaults.insert("legacy".to_string(), info);
+        manager.open_vault("legacy", "")?;
+
+        assert!(manager.is_vault_open("legacy"));
+        assert!(manager.get_vault("legacy").unwrap().is_unlocked());
+        Ok(())
     }
 
     // BackupManager tests can also be isolated

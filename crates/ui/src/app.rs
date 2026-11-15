@@ -12,6 +12,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tui_textarea::TextArea;
 use zeroize::{Zeroize, Zeroizing};
+
+/// Error shown in the vault selector when its create form is submitted. The selector cannot ask for a
+/// master password for the new vault, so it creates nothing and points to the CLI instead.
+const VAULT_CREATE_UNAVAILABLE: &str = "Creating a vault here needs a master password prompt, which is not available \
+                                        yet. Use `chamber registry create` instead.";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
     Unlock,
@@ -1170,7 +1176,8 @@ impl App {
     ///   Switches to the specified vault by its ID.
     ///
     /// - `VaultAction::Create { name, description, category }`
-    ///   Creates a new vault with the provided name, description, and category.
+    ///   Creates nothing. The selector has no master password prompt, so this shows an error in the
+    ///   selector that points to `chamber registry create` instead.
     ///
     /// - `VaultAction::Update { vault_id, name, description, category, favorite }`
     ///   Updates an existing vault with the given parameters, including optional fields like the
@@ -1203,12 +1210,8 @@ impl App {
             VaultAction::Switch(vault_id) => {
                 self.switch_to_vault(&vault_id)?;
             }
-            VaultAction::Create {
-                name,
-                description,
-                category,
-            } => {
-                self.create_vault(&name, description, &category);
+            VaultAction::Create { .. } => {
+                self.create_vault();
             }
             VaultAction::Update {
                 vault_id,
@@ -1274,39 +1277,14 @@ impl App {
         Ok(String::from(vault_id))
     }
 
-    fn create_vault(&mut self, name: &str, description: Option<String>, category: &str) {
-        // Parse category
-        let vault_category = match category.to_lowercase().as_str() {
-            "personal" => chamber_vault::VaultCategory::Personal,
-            "work" => chamber_vault::VaultCategory::Work,
-            "team" => chamber_vault::VaultCategory::Team,
-            "project" => chamber_vault::VaultCategory::Project,
-            "testing" => chamber_vault::VaultCategory::Testing,
-            "archive" => chamber_vault::VaultCategory::Archive,
-            custom => chamber_vault::VaultCategory::Custom(custom.to_string()),
-        };
-
-        // In a real implementation, you'd prompt for a password
-        let password = &self.master_input;
-
-        // Validate that we have a password
-        if password.is_empty() {
-            self.vault_selector.error_message = Some("Master password is required to create vault".to_string());
-        }
-
-        match self
-            .vault_manager
-            .create_vault(name.to_string(), None, vault_category, description, password)
-        {
-            Ok(_vault_id) => {
-                self.vault_selector.load_vaults(&self.vault_manager);
-                self.vault_selector.mode = VaultSelectorMode::Select;
-                self.set_status(format!("Created vault: {name}"), StatusType::Success);
-            }
-            Err(e) => {
-                self.vault_selector.error_message = Some(format!("Failed to create vault: {e}"));
-            }
-        }
+    /// Handles a create request from the vault selector without creating anything.
+    ///
+    /// Creating a vault needs its own master password, and the selector has no way to ask for one. The
+    /// password typed on the unlock screen is wiped after every attempt, so it cannot be reused here.
+    /// This only sets the selector's error message to `VAULT_CREATE_UNAVAILABLE`. The selector keeps its
+    /// mode, input, and vault list, and no status message is set.
+    fn create_vault(&mut self) {
+        self.vault_selector.error_message = Some(VAULT_CREATE_UNAVAILABLE.to_string());
     }
 
     fn update_vault(
