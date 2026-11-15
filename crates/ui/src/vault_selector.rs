@@ -4,6 +4,7 @@ use ratatui::{
     prelude::{Alignment, Color, Constraint, Frame, Layout, Modifier, Rect, Style},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+use zeroize::Zeroize;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum VaultSelectorMode {
@@ -304,6 +305,16 @@ impl VaultSelector {
             }
             _ => None,
         }
+    }
+
+    /// Resets the selector for a lock: zeroizes the input buffer, hides the selector, returns to select
+    /// mode, and clears the input field, error, and confirmation message. The vault list and the list
+    /// selection are kept.
+    pub fn reset_on_lock(&mut self) {
+        self.input_buffer.zeroize();
+        self.show_selector = false;
+        self.mode = VaultSelectorMode::Select;
+        self.clear_input();
     }
 
     fn clear_input(&mut self) {

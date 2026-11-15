@@ -178,6 +178,18 @@ pub(crate) fn unlock(app: &mut App) {
     assert_eq!(app.screen, Screen::Main, "unlock did not reach the main screen");
 }
 
+/// Stores a synthetic item in the unlocked App's vault and reloads the App's items.
+pub(crate) fn store_item(app: &mut App, name: &str, kind: ItemKind, value: &str) {
+    app.vault
+        .create_item(&NewItem {
+            name: name.to_string(),
+            kind,
+            value: value.to_string(),
+        })
+        .expect("store synthetic item");
+    app.refresh_items().expect("reload items");
+}
+
 /// A key-press event for `code` with no modifiers.
 pub(crate) fn key_press(code: KeyCode) -> Event {
     Event::Key(KeyEvent::new(code, KeyModifiers::NONE))

@@ -298,15 +298,7 @@ impl App {
             status_message: None,
             status_type: StatusType::Info,
             scroll_offset: 0,
-            add_value_textarea: {
-                let mut textarea = TextArea::default();
-                // Enable line numbers
-                textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
-                textarea.set_cursor_line_style(Style::default());
-                // Optional: set a placeholder text
-                textarea.set_placeholder_text("Enter your value here...");
-                textarea
-            },
+            add_value_textarea: new_value_editor(),
             countdown_info: None,
             clock,
             auto_lock_config,
@@ -1467,9 +1459,37 @@ impl App {
 
     /// Locks the TUI. This is the single function that does so.
     ///
-    /// Does nothing when already locked. Otherwise drops the vault key, closes every vault the manager
-    /// holds open, stops the inactivity timer, and returns to the unlock screen. The registry and the
-    /// vault's database path are untouched, so the same vault can be unlocked again.
+    /// Does nothing when already locked, so a password being typed on the unlock form is never erased.
+    /// Otherwise, in this order: drops the vault key, closes every vault the manager holds open, stops the
+    /// inactivity timer, discards the ended session's state (see below), sets the status to
+    /// "Locked due to inactivity", and returns to the unlock screen. The registry and the vault's database
+    /// path are untouched, so the same vault can be unlocked again.
+    ///
+    /// The lock always completes, whatever screen or dialog is open. Unsaved edits and drafts are discarded
+    /// without saving or prompting. After a lock, no live application state can show, restore, or receive
+    /// as input anything from the ended session:
+    ///
+    /// - Decrypted caches: `items` and `filtered_items` have each value zeroized and are emptied;
+    ///   `view_item` and `edit_item` have their value zeroized and become `None`.
+    /// - Password fields: `master_input`, `master_confirm_input`, `ck_current`, `ck_new`, and `ck_confirm`
+    ///   are zeroized and left empty.
+    /// - Other text buffers: `add_value`, `edit_value`, `search_query`, `add_name`, `ie_path`, and the vault
+    ///   selector's `input_buffer` are zeroized and left empty; `generated_password` is zeroized and becomes
+    ///   `None`.
+    /// - The add-item editor is replaced by a fresh one configured as at startup. The old editor's lines
+    ///   are zeroized, and consuming it drops its undo/redo history and yank buffer, so nothing can be
+    ///   restored from them. Those private allocations are released, not proven to be overwritten.
+    /// - Input modes and reveal state: `search_mode` and `view_show_value` become `false`, and the vault
+    ///   selector is hidden and back in select mode with no input field, error, or confirmation message.
+    ///   Its vault list and list selection are kept.
+    /// - Positions (`selected`, `scroll_offset`, `add_value_scroll`, `add_kind_idx`) become `0`, every focus
+    ///   field returns to its startup value, and `error` becomes `None`.
+    ///
+    /// Preferences survive a lock: `view_mode`, `gen_config`, `gen_length_str`, `ie_mode`, `ie_format_idx`,
+    /// and `master_mode_is_setup` keep their values.
+    ///
+    /// Buffers the App owns directly are wiped before release. This does not claim to erase copies the
+    /// allocator, the operating system, the terminal, or a dependency may have made earlier.
     pub fn lock(&mut self) {
         if !self.vault.is_unlocked() {
             return;
@@ -1478,9 +1498,52 @@ impl App {
         self.vault_manager.close_all_vaults();
         self.last_activity = None;
         self.countdown_info = None;
-        // Further cleanup of retained session data belongs here, before the screen change.
+        self.discard_session_state();
         self.set_status("Locked due to inactivity".to_string(), StatusType::Info);
         self.screen = Screen::Unlock;
+    }
+
+    /// Wipes and resets everything `lock` discards. See `lock` for the list.
+    fn discard_session_state(&mut self) {
+        // Decrypted caches.
+        wipe_items(&mut self.items);
+        wipe_items(&mut self.filtered_items);
+        wipe_item(&mut self.view_item);
+        wipe_item(&mut self.edit_item);
+
+        // Password fields.
+        wipe_string(&mut self.master_input);
+        wipe_string(&mut self.master_confirm_input);
+        wipe_string(&mut self.ck_current);
+        wipe_string(&mut self.ck_new);
+        wipe_string(&mut self.ck_confirm);
+
+        // Other text buffers and drafts.
+        wipe_string(&mut self.add_value);
+        wipe_string(&mut self.edit_value);
+        wipe_string(&mut self.search_query);
+        wipe_string(&mut self.add_name);
+        wipe_string(&mut self.ie_path);
+        wipe_optional_string(&mut self.generated_password);
+        wipe_editor(&mut self.add_value_textarea);
+
+        // Input modes, reveal state, and dialogs.
+        self.search_mode = false;
+        self.view_show_value = false;
+        self.vault_selector.reset_on_lock();
+
+        // Positions and focus.
+        self.selected = 0;
+        self.scroll_offset = 0;
+        self.add_value_scroll = 0;
+        self.add_kind_idx = 0;
+        self.unlock_focus = UnlockField::Master;
+        self.ck_focus = ChangeKeyField::Current;
+        self.add_focus = AddItemField::Name;
+        self.gen_focus = PasswordGenField::Length;
+        self.ie_focus = ImportExportField::Path;
+
+        self.error = None;
     }
 
     // Synchronous method for the drawing function
@@ -1497,4 +1560,50 @@ pub(crate) fn wipe_items(items: &mut Vec<Item>) {
         item.value.zeroize();
     }
     items.clear();
+}
+
+/// Builds the add-item value editor exactly as configured at startup.
+///
+/// Used by `App::with_parts` and by the lock cleanup, so a fresh editor always matches the initial one.
+pub(crate) fn new_value_editor() -> TextArea<'static> {
+    let mut textarea = TextArea::default();
+    // Enable line numbers
+    textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
+    textarea.set_cursor_line_style(Style::default());
+    textarea.set_placeholder_text("Enter your value here...");
+    textarea
+}
+
+/// Zeroizes the string's buffer and leaves it empty.
+pub(crate) fn wipe_string(s: &mut String) {
+    s.zeroize();
+}
+
+/// Zeroizes the held string, if any, then sets the option to `None`.
+pub(crate) fn wipe_optional_string(s: &mut Option<String>) {
+    if let Some(inner) = s.as_mut() {
+        inner.zeroize();
+    }
+    *s = None;
+}
+
+/// Zeroizes the held item's secret `value`, if any, then sets the option to `None`.
+///
+/// Item names are stored unencrypted, so they are not zeroized.
+pub(crate) fn wipe_item(item: &mut Option<Item>) {
+    if let Some(inner) = item.as_mut() {
+        inner.value.zeroize();
+    }
+    *item = None;
+}
+
+/// Replaces the editor with a fresh one from `new_value_editor` and zeroizes every line of the old one.
+///
+/// Consuming the old editor with `into_lines` drops its undo/redo history and yank buffer, so the new
+/// editor cannot restore them. Those private allocations are released, not proven to be overwritten.
+pub(crate) fn wipe_editor(editor: &mut TextArea<'static>) {
+    let old = std::mem::replace(editor, new_value_editor());
+    for mut line in old.into_lines() {
+        line.zeroize();
+    }
 }

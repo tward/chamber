@@ -277,7 +277,6 @@ fn ac3_key_at_or_after_expiry_is_discarded() -> Result<()> {
                 h.app.search_mode = true;
                 h.app.search_query = "zz".to_string();
             }
-            let query = h.app.search_query.clone();
 
             h.clock.advance(TIMEOUT + late_by);
             assert!(!press(&mut h, KeyCode::Char('w'))?);
@@ -286,7 +285,8 @@ fn ac3_key_at_or_after_expiry_is_discarded() -> Result<()> {
                 h.app.master_input.is_empty(),
                 "discarded key reached the unlock handler"
             );
-            assert_eq!(h.app.search_query, query, "discarded key reached the search handler");
+            // The lock wipes the query, so a key that reached the search handler would leave "w" here.
+            assert_eq!(h.app.search_query, "", "discarded key reached the search handler");
 
             let frame = render(&mut h.app, WIDTH, HEIGHT);
             assert_no_countdown_text(&frame);
