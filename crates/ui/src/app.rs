@@ -11,6 +11,7 @@ use ratatui::style::Color;
 use std::path::PathBuf;
 use std::time::Duration;
 use tui_textarea::TextArea;
+use zeroize::{Zeroize, Zeroizing};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
     Unlock,
@@ -352,79 +353,91 @@ impl App {
         Ok(())
     }
 
-    /// Unlocks the application vault using the provided master key and performs necessary validations.
+    /// Submits the unlock or setup form. Every outcome is handled here; nothing is returned to the event loop.
     ///
-    /// This function checks if the master key setup process is initiated, validates the user input,
-    /// and sets up or unlocks the vault accordingly. In case of errors during validation or unlocking
-    /// operations, appropriate error messages are set.
+    /// In setup mode (the vault is not initialized yet), the two inputs must match and pass
+    /// `validate_master_strength`, and then the vault is initialized. A failure sets `error` to
+    /// "Passwords do not match", the strength message, or "Setup failed: {e}" and keeps the setup form.
+    /// After a successful `initialize`, `master_mode_is_setup` becomes `false` for good and the same
+    /// password continues into the unlock steps.
     ///
-    /// ## Steps
-    /// 1. If `master_mode_is_setup` is true:
-    ///     - Validate the presence of master input and confirmation input. If either is empty, an error
-    ///       message is set, and the function will return early.
-    ///     - Compare `master_input` and `master_confirm_input`. If they do not match, an error message
-    ///       is set, and the function exits.
-    ///     - Validate the strength of the `master_input` using `validate_master_strength`. If it fails,
-    ///       sets an error message and exits.
-    ///     - Initialize the vault with `master_input` and reset the `master_mode_is_setup` flag to false.
-    /// 2. Unlock the vault with the provided `master_input`. On failure to unlock, sets an error message
-    ///    with the reason and exits with the corresponding error.
-    /// 3. Refresh the items in the application to reflect the unlocked state.
-    /// 4. Set the current screen to `Screen::Main`.
-    /// 5. Clear any existing error messages to indicate successful operation.
-    /// 6. Return `Ok(())` if no errors occurred.
+    /// The unlock steps unlock the vault and load its items. A wrong password sets `error` to
+    /// "Invalid master password" and leaves the vault locked. If loading the items fails, the vault is
+    /// locked again, the item caches are wiped, no timer runs, `status_message` is cleared, and `error` is
+    /// "Unlock failed: could not load items: {e}". On success the items are cached, `error` and
+    /// `status_message` are cleared, the main screen is shown, and the inactivity timer starts with a full
+    /// interval when auto-lock is enabled.
     ///
-    /// ## Returns
-    /// - `Ok(())` on successful unlocking and initialization of the vault.
-    /// - `Err` with the propagation of error from validation or unlocking operations.
+    /// Whatever the outcome, `master_input` and `master_confirm_input` are zeroized and left empty, so the
+    /// master password is never retained. `unlock_focus` is never changed.
+    pub fn unlock(&mut self) {
+        self.unlock_with(Vault::list_items);
+    }
+
+    /// `unlock` with the item loader as a parameter, so tests can supply one that fails.
     ///
-    /// ## Errors
-    /// This function sets the `error` field with one of the following messages on failure:
-    /// - "Please enter and confirm your master key." - if either master input or confirmation input is missing.
-    /// - "Master keys do not match." - if the confirmation of the master key does not match the input.
-    /// - Error message returned by `validate_master_strength` - if the master key is deemed weak or invalid.
-    /// - "Unlock failed: {e}" - if unlocking the vault fails.
-    ///
-    /// ## Side Effects
-    /// - Updates the `error` field in the struct to reflect any issues encountered during execution.
-    /// - Modifies the state of `screen`, `master_mode_is_setup`, and `vault` upon successful execution.
-    pub fn unlock(&mut self) -> Result<()> {
+    /// Production always passes `Vault::list_items`.
+    pub(crate) fn unlock_with(&mut self, load_items: impl FnOnce(&Vault) -> Result<Vec<Item>>) {
+        // Moving the buffers out (no copy) empties both fields now and zeroizes the bytes when these drop,
+        // on every exit path of the attempt.
+        let master = Zeroizing::new(std::mem::take(&mut self.master_input));
+        let confirm = Zeroizing::new(std::mem::take(&mut self.master_confirm_input));
+        self.attempt_unlock(&master, &confirm, load_items);
+    }
+
+    /// One unlock or setup attempt with borrowed inputs. See `unlock` for the outcomes.
+    fn attempt_unlock(&mut self, master: &str, confirm: &str, load_items: impl FnOnce(&Vault) -> Result<Vec<Item>>) {
         if self.master_mode_is_setup {
-            // Setup mode: create new master password (needs confirmation)
-            if self.master_input != self.master_confirm_input {
+            if master != confirm {
                 self.error = Some("Passwords do not match".to_string());
-                return Ok(());
+                return;
             }
-
-            Self::validate_master_strength(&self.master_input)?;
-
-            // Initialize the vault
-            self.vault.initialize(&self.master_input)?;
+            if let Err(e) = Self::validate_master_strength(master) {
+                self.error = Some(e.to_string());
+                return;
+            }
+            if let Err(e) = self.vault.initialize(master) {
+                self.error = Some(format!("Setup failed: {e}"));
+                return;
+            }
+            // The vault is initialized now, so the setup form never comes back.
+            self.master_mode_is_setup = false;
         }
 
-        // Always try to unlock (works for both setup and normal mode)
-        if let Ok(()) = self.vault.unlock(&self.master_input) {
-            self.refresh_items()?;
-            // The inactivity timer starts here and nowhere else.
-            self.last_activity = if self.auto_lock_config.enabled {
-                Some(self.clock.now())
-            } else {
-                None
-            };
-            self.status_message = None;
-            self.screen = Screen::Main;
-            self.error = None;
-            self.master_input.clear();
-            self.master_confirm_input.clear();
-        } else {
+        if self.vault.unlock(master).is_err() {
             self.error = Some("Invalid master password".to_string());
-            self.master_input.clear();
-            if self.master_mode_is_setup {
-                self.master_confirm_input.clear();
-            }
+            return;
         }
 
-        Ok(())
+        match load_items(&self.vault) {
+            Ok(items) => {
+                wipe_items(&mut self.items);
+                wipe_items(&mut self.filtered_items);
+                self.items = items;
+                self.update_filtered_items();
+                if self.selected >= self.filtered_items.len() && !self.filtered_items.is_empty() {
+                    self.selected = self.filtered_items.len().saturating_sub(1);
+                }
+                self.error = None;
+                self.status_message = None;
+                self.screen = Screen::Main;
+                // The inactivity timer starts here and nowhere else, after loading has finished.
+                self.last_activity = if self.auto_lock_config.enabled {
+                    Some(self.clock.now())
+                } else {
+                    None
+                };
+            }
+            Err(e) => {
+                self.vault.lock();
+                wipe_items(&mut self.items);
+                wipe_items(&mut self.filtered_items);
+                self.last_activity = None;
+                self.countdown_info = None;
+                self.error = Some(format!("Unlock failed: could not load items: {e}"));
+                self.status_message = None;
+            }
+        }
     }
 
     /// Refreshes the list of items and updates the filtered items.
@@ -1474,4 +1487,14 @@ impl App {
     pub const fn get_countdown_info(&self) -> Option<&CountdownInfo> {
         self.countdown_info.as_ref()
     }
+}
+
+/// Zeroizes each item's secret `value`, then empties the vector.
+///
+/// Item names are stored unencrypted, so they are not zeroized.
+pub(crate) fn wipe_items(items: &mut Vec<Item>) {
+    for item in items.iter_mut() {
+        item.value.zeroize();
+    }
+    items.clear();
 }

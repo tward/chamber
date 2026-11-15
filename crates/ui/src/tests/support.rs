@@ -174,7 +174,7 @@ pub(crate) fn unlock(app: &mut App) {
     if app.master_mode_is_setup {
         app.master_confirm_input = MASTER_PASSWORD.to_string();
     }
-    app.unlock().expect("unlock");
+    app.unlock();
     assert_eq!(app.screen, Screen::Main, "unlock did not reach the main screen");
 }
 

@@ -353,7 +353,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         Screen::Unlock => match key.code {
             KeyCode::Esc => return Ok(true),
             KeyCode::Enter => {
-                app.unlock()?;
+                app.unlock();
             }
             KeyCode::Tab => {
                 if app.master_mode_is_setup {
