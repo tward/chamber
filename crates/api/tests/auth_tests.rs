@@ -1,6 +1,6 @@
 use crate::common::TestContext;
 use crate::common::fixtures::sample_login_request;
-use chamber_api::models::{ApiResponse, LoginRequest, LoginResponse};
+use chamber_api::models::{ApiResponse, ItemResponse, ItemWithValueResponse, LoginRequest, LoginResponse};
 use http::StatusCode;
 use serde_json::json;
 mod common;
@@ -283,6 +283,157 @@ async fn test_logout_without_auth() -> color_eyre::Result<()> {
 
     let response = ctx.server.post("/api/v1/auth/logout").await;
     response.assert_status_unauthorized();
+
+    Ok(())
+}
+
+/// Asserts that the item endpoints return the given item unchanged: same id, name, kind, and value.
+async fn assert_item_intact(ctx: &TestContext, token: &str, id: u64, name: &str, kind: &str, value: &str) {
+    let response = ctx
+        .server
+        .get(&format!("/api/v1/items/{id}"))
+        .authorization_bearer(token)
+        .await;
+    response.assert_status_ok();
+    let body: ApiResponse<ItemResponse> = response.json();
+    assert_eq!(body.data.id, id);
+    assert_eq!(body.data.name, name);
+    assert_eq!(body.data.kind, kind);
+
+    let response = ctx
+        .server
+        .get(&format!("/api/v1/items/{id}/value"))
+        .authorization_bearer(token)
+        .await;
+    response.assert_status_ok();
+    let body: ApiResponse<ItemWithValueResponse> = response.json();
+    assert_eq!(body.data.id, id);
+    assert_eq!(body.data.name, name);
+    assert_eq!(body.data.kind, kind);
+    assert!(body.data.value == value, "item value changed across the lock");
+}
+
+#[tokio::test]
+async fn test_session_lock_drops_vault_key_and_unlock_restores_it() -> color_eyre::Result<()> {
+    let mut ctx = TestContext::new()?;
+    let token = ctx.login().await?;
+
+    let (name, kind, value) = ("lock_cycle_item", "password", "synthetic_value_lock_cycle");
+    let id = ctx.create_test_item(name, kind, value).await?;
+    let unlocked = ctx.vault.lock().await.is_unlocked();
+    assert!(unlocked, "vault should hold its key after login");
+
+    // Lock: the key must be gone, not just hidden behind the flag
+    let response = ctx
+        .server
+        .post("/api/v1/session/lock")
+        .authorization_bearer(&token)
+        .await;
+    response.assert_status_ok();
+    let body: ApiResponse<String> = response.json();
+    assert_eq!(body.data, "Session locked successfully");
+    let unlocked = ctx.vault.lock().await.is_unlocked();
+    assert!(!unlocked, "vault key should be dropped after session lock");
+
+    let items_response = ctx.server.get("/api/v1/items").authorization_bearer(&token).await;
+    items_response.assert_status(StatusCode::BAD_REQUEST);
+    let value_response = ctx
+        .server
+        .get(&format!("/api/v1/items/{id}/value"))
+        .authorization_bearer(&token)
+        .await;
+    value_response.assert_status(StatusCode::BAD_REQUEST);
+
+    // A wrong password must not restore the key
+    let response = ctx
+        .server
+        .post("/api/v1/session/unlock")
+        .authorization_bearer(&token)
+        .json(&json!({ "master_password": "wrong_password" }))
+        .await;
+    response.assert_status_unauthorized();
+    let unlocked = ctx.vault.lock().await.is_unlocked();
+    assert!(!unlocked, "vault should stay locked after a wrong unlock password");
+    let items_response = ctx.server.get("/api/v1/items").authorization_bearer(&token).await;
+    items_response.assert_status(StatusCode::BAD_REQUEST);
+
+    // The correct password restores the key and the original data
+    let response = ctx
+        .server
+        .post("/api/v1/session/unlock")
+        .authorization_bearer(&token)
+        .json(&json!({ "master_password": ctx.master_password }))
+        .await;
+    response.assert_status_ok();
+    let unlocked = ctx.vault.lock().await.is_unlocked();
+    assert!(unlocked, "vault should hold its key again after a correct unlock");
+
+    assert_item_intact(&ctx, &token, id, name, kind, value).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_logout_drops_vault_key_and_login_restores_it() -> color_eyre::Result<()> {
+    let mut ctx = TestContext::new()?;
+    let token = ctx.login().await?;
+
+    let (name, kind, value) = ("logout_cycle_item", "note", "synthetic_value_logout_cycle");
+    let id = ctx.create_test_item(name, kind, value).await?;
+
+    let response = ctx
+        .server
+        .post("/api/v1/auth/logout")
+        .authorization_bearer(&token)
+        .await;
+    response.assert_status_ok();
+    let body: ApiResponse<String> = response.json();
+    assert_eq!(body.data, "Logged out successfully");
+    let unlocked = ctx.vault.lock().await.is_unlocked();
+    assert!(!unlocked, "vault key should be dropped after logout");
+
+    let items_response = ctx.server.get("/api/v1/items").authorization_bearer(&token).await;
+    items_response.assert_status(StatusCode::BAD_REQUEST);
+
+    // Logging in again restores the key, and the new token sees the original item
+    let new_token = ctx.login().await?;
+    let unlocked = ctx.vault.lock().await.is_unlocked();
+    assert!(unlocked, "vault should hold its key again after login");
+
+    assert_item_intact(&ctx, &new_token, id, name, kind, value).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_repeated_lock_and_logout_on_locked_vault_succeed() -> color_eyre::Result<()> {
+    let mut ctx = TestContext::new()?;
+    let token = ctx.login().await?;
+
+    for _ in 0..2 {
+        let response = ctx
+            .server
+            .post("/api/v1/session/lock")
+            .authorization_bearer(&token)
+            .await;
+        response.assert_status_ok();
+        let body: ApiResponse<String> = response.json();
+        assert_eq!(body.data, "Session locked successfully");
+        let unlocked = ctx.vault.lock().await.is_unlocked();
+        assert!(!unlocked, "vault should stay locked after each session lock");
+    }
+
+    // Logout on an already locked vault is also a successful no-op
+    let response = ctx
+        .server
+        .post("/api/v1/auth/logout")
+        .authorization_bearer(&token)
+        .await;
+    response.assert_status_ok();
+    let body: ApiResponse<String> = response.json();
+    assert_eq!(body.data, "Logged out successfully");
+    let unlocked = ctx.vault.lock().await.is_unlocked();
+    assert!(!unlocked, "vault should stay locked after logout on a locked vault");
 
     Ok(())
 }
