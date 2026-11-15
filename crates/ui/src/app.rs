@@ -1,17 +1,17 @@
 use crate::app;
+use crate::clock::{Clock, ClockReading, SystemClock};
 use crate::vault_selector::{VaultAction, VaultSelector, VaultSelectorMode};
-use async_trait::async_trait;
 use chamber_import_export::{ExportFormat, export_items, import_items};
 use chamber_password_gen::PasswordConfig;
-use chamber_vault::{AutoLockCallback, AutoLockConfig, AutoLockService, Item, ItemKind, NewItem, Vault, VaultManager};
+use chamber_vault::{AutoLockConfig, Item, ItemKind, NewItem, Vault, VaultManager};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use ratatui::prelude::Style;
 use ratatui::style::Color;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::time::Duration;
 use tui_textarea::TextArea;
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
     Unlock,
     Main,
@@ -84,7 +84,7 @@ impl ViewMode {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusType {
     Info,
     Success,
@@ -121,19 +121,6 @@ pub struct CountdownInfo {
     pub seconds_left: i64,
 }
 
-pub struct TuiAutoLockCallback {
-    // Callback to lock the TUI app
-}
-
-#[async_trait]
-impl AutoLockCallback for TuiAutoLockCallback {
-    async fn on_auto_lock(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Lock the vault in TUI mode
-        // This could set a flag that the main loop checks
-        Ok(())
-    }
-}
-
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     clipboard: crate::clipboard::Clipboard,
@@ -163,9 +150,14 @@ pub struct App {
     pub status_type: StatusType,
     pub scroll_offset: usize,
     pub add_value_textarea: TextArea<'static>,
-    pub auto_lock_service: Option<Arc<AutoLockService>>,
-    pub auto_locked: bool,
     pub countdown_info: Option<CountdownInfo>,
+
+    // Inactivity timer, owned by the event loop. Only `enabled` and `inactivity_timeout_minutes`
+    // are read from the config.
+    clock: Box<dyn Clock>,
+    auto_lock_config: AutoLockConfig,
+    /// Reading of the last activity while unlocked. `None` while locked or when auto-lock is disabled.
+    last_activity: Option<ClockReading>,
 
     // Change passes key dialog fields
     pub ck_current: String,
@@ -257,21 +249,31 @@ impl App {
     pub fn new() -> Result<Self> {
         let vault = Vault::open_default()?;
         let vault_manager = VaultManager::new()?;
+        Ok(Self::with_parts(
+            vault,
+            vault_manager,
+            AutoLockConfig::default(),
+            Box::new(SystemClock::new()),
+            crate::clipboard::Clipboard::default(),
+        ))
+    }
+
+    /// Builds an `App` from already constructed parts. Opens nothing and reads no global state.
+    ///
+    /// The App starts on the unlock screen, in setup mode when the vault is not yet initialized.
+    pub(crate) fn with_parts(
+        vault: Vault,
+        vault_manager: VaultManager,
+        auto_lock_config: AutoLockConfig,
+        clock: Box<dyn Clock>,
+        clipboard: crate::clipboard::Clipboard,
+    ) -> Self {
         let vault_selector = VaultSelector::new();
+        // Setup mode (create master password) when the vault has no master key yet.
+        let master_mode_is_setup = !vault.is_initialized();
 
-        // Determine initial screen based on vault state
-        let (_, master_mode_is_setup) = if vault.is_initialized() {
-            (Screen::Unlock, false) // Just unlock, no setup
-        } else {
-            (Screen::Unlock, true) // Setup mode (create master password)
-        };
-
-        let auto_lock_config = AutoLockConfig::default();
-        let callback = Arc::new(TuiAutoLockCallback {});
-        let auto_lock_service = Some(Arc::new(AutoLockService::new(auto_lock_config, callback)));
-
-        Ok(Self {
-            clipboard: crate::clipboard::Clipboard::default(),
+        Self {
+            clipboard,
             vault,
             vault_manager,
             vault_selector,
@@ -304,9 +306,10 @@ impl App {
                 textarea.set_placeholder_text("Enter your value here...");
                 textarea
             },
-            auto_lock_service,
-            auto_locked: false,
             countdown_info: None,
+            clock,
+            auto_lock_config,
+            last_activity: None,
 
             ck_current: String::new(),
             ck_new: String::new(),
@@ -330,7 +333,7 @@ impl App {
             ie_path: String::new(),
             ie_format_idx: 0,
             ie_formats: vec!["json", "csv", "backup"],
-        })
+        }
     }
 
     fn validate_master_strength(s: &str) -> Result<()> {
@@ -402,6 +405,13 @@ impl App {
         // Always try to unlock (works for both setup and normal mode)
         if let Ok(()) = self.vault.unlock(&self.master_input) {
             self.refresh_items()?;
+            // The inactivity timer starts here and nowhere else.
+            self.last_activity = if self.auto_lock_config.enabled {
+                Some(self.clock.now())
+            } else {
+                None
+            };
+            self.status_message = None;
             self.screen = Screen::Main;
             self.error = None;
             self.master_input.clear();
@@ -1376,41 +1386,88 @@ impl App {
             }
         }
     }
-    pub async fn update_activity(&mut self) {
-        if let Some(service) = &self.auto_lock_service {
-            service.update_activity().await;
+
+    /// Takes a reading from the App's clock.
+    pub(crate) fn now(&self) -> ClockReading {
+        self.clock.now()
+    }
+
+    /// The configured inactivity timeout.
+    const fn auto_lock_timeout(&self) -> Duration {
+        Duration::from_secs(self.auto_lock_config.inactivity_timeout_minutes.saturating_mul(60))
+    }
+
+    /// Inactivity since `since`: the larger of the monotonic and wall-clock elapsed times.
+    ///
+    /// The wall clock makes suspended time count. Taking the larger of the two means moving the wall clock
+    /// backward cannot extend a session, while moving it forward can lock early.
+    fn elapsed_inactivity(since: ClockReading, now: ClockReading) -> Duration {
+        let monotonic = now.monotonic.saturating_sub(since.monotonic);
+        let wall = now.wall.duration_since(since.wall).unwrap_or(Duration::ZERO);
+        monotonic.max(wall)
+    }
+
+    /// Time left before auto-lock, floored at zero. `None` when no timer is running.
+    pub(crate) fn time_until_auto_lock(&self, now: ClockReading) -> Option<Duration> {
+        self.last_activity.map(|since| {
+            self.auto_lock_timeout()
+                .saturating_sub(Self::elapsed_inactivity(since, now))
+        })
+    }
+
+    /// Restarts the inactivity timer. Does nothing while locked or when auto-lock is disabled.
+    pub(crate) const fn record_activity(&mut self, now: ClockReading) {
+        if self.vault.is_unlocked() && self.auto_lock_config.enabled {
+            self.last_activity = Some(now);
         }
     }
 
-    pub async fn check_auto_lock(&mut self) -> bool {
-        if let Some(service) = &self.auto_lock_service {
-            if service.activity_tracker.should_auto_lock().await {
-                self.auto_locked = true;
-                self.screen = Screen::Unlock;
-                return true;
-            }
+    /// Locks the App when it is unlocked and the inactivity timer has expired. Returns whether it locked.
+    pub(crate) fn lock_if_expired(&mut self, now: ClockReading) -> bool {
+        let expired = self
+            .last_activity
+            .is_some_and(|since| Self::elapsed_inactivity(since, now) >= self.auto_lock_timeout());
+        if self.vault.is_unlocked() && expired {
+            self.lock();
+            true
+        } else {
+            false
         }
-        false
     }
 
-    pub async fn get_time_until_auto_lock(&self) -> Option<chrono::Duration> {
-        if let Some(service) = &self.auto_lock_service {
-            service.get_time_until_lock().await
+    /// One timer step of the event loop: locks on expiry, then recomputes the countdown.
+    pub(crate) fn tick(&mut self, now: ClockReading) {
+        self.lock_if_expired(now);
+        self.countdown_info = if self.vault.is_unlocked() {
+            self.time_until_auto_lock(now).map(|remaining| {
+                let secs = i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX);
+                CountdownInfo {
+                    enabled: true,
+                    minutes_left: secs / 60,
+                    seconds_left: secs,
+                }
+            })
         } else {
             None
-        }
+        };
     }
 
-    pub async fn update_countdown_info(&mut self) {
-        if let Some(time_left) = self.get_time_until_auto_lock().await {
-            self.countdown_info = Some(CountdownInfo {
-                enabled: true,
-                minutes_left: time_left.num_minutes(),
-                seconds_left: time_left.num_seconds(),
-            });
-        } else {
-            self.countdown_info = None;
+    /// Locks the TUI. This is the single function that does so.
+    ///
+    /// Does nothing when already locked. Otherwise drops the vault key, closes every vault the manager
+    /// holds open, stops the inactivity timer, and returns to the unlock screen. The registry and the
+    /// vault's database path are untouched, so the same vault can be unlocked again.
+    pub fn lock(&mut self) {
+        if !self.vault.is_unlocked() {
+            return;
         }
+        self.vault.lock();
+        self.vault_manager.close_all_vaults();
+        self.last_activity = None;
+        self.countdown_info = None;
+        // Further cleanup of retained session data belongs here, before the screen change.
+        self.set_status("Locked due to inactivity".to_string(), StatusType::Info);
+        self.screen = Screen::Unlock;
     }
 
     // Synchronous method for the drawing function

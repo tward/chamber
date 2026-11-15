@@ -2,6 +2,7 @@ use crate::app::{
     AddItemField, App, ChangeKeyField, ImportExportField, ImportExportMode, ItemCounts, PasswordGenField, Screen,
     StatusType, UnlockField, ViewMode,
 };
+use crate::clock::ClockReading;
 use chamber_vault::ItemKind;
 use color_eyre::Result;
 use ratatui::crossterm::event;
@@ -125,10 +126,18 @@ fn truncate_text(text: &str, max_width: usize) -> String {
 /// Runs the application in a terminal-based user interface with an event loop.
 ///
 /// This function initializes a terminal using the Crossterm backend, clears its
-/// contents, and enters an event loop. In this loop, it draws the application's
-/// current state to the terminal and waits for user input events. When a key
-/// event occurs, it processes the event and checks if the application should
-/// exit. The loop exits when the `handle_key` function signals to terminate.
+/// contents, and enters an event loop. The loop owns the inactivity timer; no
+/// background task is started. Each iteration:
+///
+/// 1. Takes a clock reading.
+/// 2. Calls `App::tick`, which locks the App when the inactivity timer has expired
+///    and recomputes the auto-lock countdown.
+/// 3. Draws the current state.
+/// 4. Polls for an event for at most 250 milliseconds.
+/// 5. If an event arrived, reads it, takes a new clock reading, and passes both to
+///    `handle_event`. The loop exits when `handle_event` signals to quit.
+///
+/// Every iteration polls; no path skips input.
 ///
 /// # Arguments
 ///
@@ -147,50 +156,53 @@ fn truncate_text(text: &str, max_width: usize) -> String {
 /// * If the terminal backend cannot be initialized.
 /// * If the terminal fails to clear its contents or render the UI.
 /// * If there is an error reading input events or processing them.
-///
-/// # Notes
-///
-/// * The terminal clearing and rendering are achieved using the `Terminal` and
-///   `CrosstermBackend` from the `tui` (Terminal User Interface) library.
-/// * The event loop uses a polling mechanism to periodically check for input
-///   using `event::poll`, blocking for 250 milliseconds before timing out.
-/// * Pressing specific keys, as determined by the `handle_key` function, can
-///   terminate the event loop.
+// The body awaits nothing, but the signature stays async because callers await it.
+#[allow(clippy::unused_async)]
 pub async fn run_app(app: &mut App) -> Result<()> {
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
-
-    let mut last_countdown_update = std::time::Instant::now();
-    let countdown_update_interval = std::time::Duration::from_secs(1);
-
     terminal.clear()?;
-    let _auto_lock_handle = if let Some(service) = &app.auto_lock_service {
-        Some(service.start().await)
-    } else {
-        None
-    };
 
     loop {
-        if last_countdown_update.elapsed() >= countdown_update_interval {
-            app.update_countdown_info().await;
-            last_countdown_update = std::time::Instant::now();
-        }
-
+        let reading = app.now();
+        app.tick(reading);
         terminal.draw(|f| draw(f, app))?;
-        if app.check_auto_lock().await {
-            continue;
-        }
 
         if event::poll(std::time::Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                app.update_activity().await;
-                if key.kind == KeyEventKind::Press && handle_key(app, key)? {
-                    break;
-                }
+            let event = event::read()?;
+            let now = app.now();
+            if handle_event(app, &event, now)? {
+                break;
             }
         }
     }
     Ok(())
+}
+
+/// Handles one polled event with the clock reading taken when it was read.
+///
+/// Only key presses count. Any other event (mouse, resize, focus, paste, key release or
+/// repeat) is ignored. A key press that arrives after the inactivity timer expired locks
+/// the App and is discarded without reaching any handler. Otherwise the key press counts
+/// as activity, whether or not a handler acts on it, and is dispatched to `handle_key`.
+///
+/// Returns `true` only when the app should quit.
+///
+/// # Errors
+///
+/// Returns an error when the key handler fails.
+pub(crate) fn handle_event(app: &mut App, event: &Event, now: ClockReading) -> Result<bool> {
+    let Event::Key(key) = event else {
+        return Ok(false);
+    };
+    if key.kind != KeyEventKind::Press {
+        return Ok(false);
+    }
+    if app.lock_if_expired(now) {
+        return Ok(false);
+    }
+    app.record_activity(now);
+    handle_key(app, *key)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -704,7 +716,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     Ok(false)
 }
 
-fn draw(f: &mut Frame, app: &mut App) {
+pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let size = f.area();
     let bg_block = Block::default().style(Style::default().bg(c_bg()));
     f.render_widget(bg_block, size);
@@ -1389,10 +1401,11 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(status_block, area);
 
-    // Check if we need to show auto-lock countdown
-    let show_countdown = app
-        .get_countdown_info()
-        .is_some_and(|info| info.minutes_left <= 3 && info.enabled);
+    // Show the auto-lock countdown only while unlocked. A stale value left over after a lock never shows.
+    let show_countdown = app.vault.is_unlocked()
+        && app
+            .get_countdown_info()
+            .is_some_and(|info| info.minutes_left <= 3 && info.enabled);
 
     if show_countdown {
         // Split into three parts: status message, countdown, key hints

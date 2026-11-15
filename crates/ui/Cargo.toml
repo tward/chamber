@@ -24,3 +24,6 @@ tui-textarea = {workspace = true}
 color-eyre = {workspace = true}
 async-trait = {workspace = true}
 chrono = {workspace = true}
+
+[dev-dependencies]
+tempfile = { workspace = true }
