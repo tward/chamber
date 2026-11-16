@@ -352,7 +352,6 @@ pub(crate) fn hex_encode(data: &[u8]) -> String {
     s
 }
 
-// Rust
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
