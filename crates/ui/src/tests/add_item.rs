@@ -3,6 +3,7 @@
 use super::support::{
     Harness, assert_editor_fresh, assert_editor_settings_match_fresh_app, auto_lock, harness, unlock,
 };
+use crate::app::{Screen, StatusType};
 
 /// Fills the add-item value editor with undo history and yank content, leaving the draft value in place.
 fn fill_editor(h: &mut Harness) {
@@ -16,7 +17,7 @@ fn fill_editor(h: &mut Harness) {
 }
 
 #[test]
-fn ac8_add_item_wipes_editor() {
+fn add_item_success_wipes_and_rebuilds_editor() {
     let mut h = harness(auto_lock(false, 0));
 
     unlock(&mut h.app);
@@ -30,10 +31,26 @@ fn ac8_add_item_wipes_editor() {
     let stored = h.app.vault.list_items().expect("list stored items");
     let added = stored.iter().find(|i| i.name == "test-item").expect("added item");
     assert_eq!(added.value, "qqeditorvalue", "vault holds added item value");
-    assert!(
-        h.app.items.iter().any(|i| i.name == "test-item"),
-        "items list holds added item"
+    let cached = h
+        .app
+        .items
+        .iter()
+        .find(|i| i.name == "test-item")
+        .expect("items list holds added item");
+    assert_eq!(cached.value, "qqeditorvalue", "items list holds added item value");
+
+    assert_eq!(h.app.screen, Screen::Main, "add_item returns to the main screen");
+    assert_eq!(
+        h.app.error.as_deref(),
+        Some("Item added."),
+        "add_item sets the confirmation text"
     );
+    assert_eq!(
+        h.app.status_message.as_deref(),
+        Some("Item added successfully."),
+        "add_item sets the status message"
+    );
+    assert_eq!(h.app.status_type, StatusType::Success, "add_item sets a success status");
 
     assert_editor_fresh(&mut h.app);
     assert_editor_settings_match_fresh_app(&h.app);
