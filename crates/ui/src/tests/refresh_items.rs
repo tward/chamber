@@ -7,6 +7,10 @@ use chamber_vault::ItemKind;
 const SECOND_NAME: &str = "zz-synthetic-second-name";
 /// Value of the second synthetic item stored on top of the harness item.
 const SECOND_VALUE: &str = "qq-synthetic-second-value";
+/// Name of the third synthetic item stored on top of the harness item.
+const THIRD_NAME: &str = "zz-synthetic-third-name";
+/// Value of the third synthetic item stored on top of the harness item.
+const THIRD_VALUE: &str = "qq-synthetic-third-value";
 
 #[test]
 fn refresh_items_clamps_selection_past_the_end() {
@@ -14,9 +18,10 @@ fn refresh_items_clamps_selection_past_the_end() {
     unlock(&mut h.app);
 
     store_item(&mut h.app, SECOND_NAME, ItemKind::Password, SECOND_VALUE);
+    store_item(&mut h.app, THIRD_NAME, ItemKind::Password, THIRD_VALUE);
     assert!(
-        h.app.filtered_items.len() >= 2,
-        "setup needs at least two listed items, got {}",
+        h.app.filtered_items.len() >= 3,
+        "setup needs at least three listed items, got {}",
         h.app.filtered_items.len()
     );
 
@@ -50,5 +55,10 @@ fn refresh_items_clamps_selection_past_the_end() {
         h.app.selected,
         h.app.filtered_items.len() - 1,
         "selection is clamped to the last entry of the reloaded list"
+    );
+    assert!(
+        h.app.selected > 0,
+        "clamped selection {} must be past the first entry, so a reset to the first entry would not satisfy the test",
+        h.app.selected
     );
 }
