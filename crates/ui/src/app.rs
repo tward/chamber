@@ -1170,8 +1170,10 @@ impl App {
     ///
     /// # Returns
     ///
-    /// * `Result<()>` - Returns `Ok(())` if the action was processed successfully; otherwise,
-    ///   an error is returned if any operation fails.
+    /// * `Result<()>` - Returns `Ok(())` for every action, including `Create`, `Update`, `Delete`, and `Import`
+    ///   when they fail: those four report their failures through the UI. An error is returned only when
+    ///   switching to a vault fails, and not every failed switch returns one: a vault with a different master
+    ///   password is reported in the selector and the call returns `Ok(())`.
     ///
     /// # `VaultAction` Variants
     ///
