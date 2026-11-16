@@ -1200,12 +1200,12 @@ impl App {
     ///   Hides the vault selector and switches back to the main screen.
     ///
     /// - `VaultAction::ShowHelp`
-    ///   Displays help information. (This action may be handled or ignored based on needs.)
+    ///   Currently does nothing.
     ///
     /// # Errors
     ///
-    /// Returns an error if switching to a vault fails. Other actions (`Create`, `Update`, `Delete`,
-    /// `Import`, `Refresh`, `Close`, `ShowHelp`) report failures through the UI and return `Ok(())`.
+    /// Returns an error only when switching to a vault fails. `Create`, `Update`, `Delete`, and `Import` report
+    /// their failures through the UI and return `Ok(())`.
     pub fn handle_vault_action(&mut self, action: VaultAction) -> Result<()> {
         match action {
             VaultAction::Switch(vault_id) => {
