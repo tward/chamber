@@ -860,7 +860,7 @@ mod lib_module_tests {
     #![allow(clippy::panic_in_result_fn)]
     #![allow(clippy::expect_used)]
     use super::*;
-    use std::fmt::Write;
+    use crate::crypto::hex_encode;
     use std::fs;
     use std::str::FromStr;
 
@@ -1271,14 +1271,6 @@ mod lib_module_tests {
         reopened.unlock("")?;
         assert!(reopened.is_unlocked());
         Ok(())
-    }
-
-    fn hex_encode(data: &[u8]) -> String {
-        let mut s = String::with_capacity(64);
-        for b in data {
-            let _ = write!(s, "{b:02x}");
-        }
-        s
     }
 
     #[test]

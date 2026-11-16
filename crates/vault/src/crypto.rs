@@ -10,8 +10,9 @@ use zeroize::Zeroize;
 
 pub type HmacSha256 = Hmac<Sha256>;
 
-/// A 32-byte key material that implements `Debug` with redacted output
-/// to prevent key bytes from appearing in debug prints.
+/// A 32-byte key material whose `Debug` implementation is deliberately redacted: it writes only
+/// `KeyMaterial(<redacted>)`, so that any type holding a `KeyMaterial`, such as `Vault` and `VaultManager`,
+/// can derive `Debug` and never print key bytes.
 #[derive(Clone)]
 pub struct KeyMaterial(pub [u8; 32]);
 impl std::fmt::Debug for KeyMaterial {
@@ -340,12 +341,22 @@ pub fn aead_decrypt(vault_key: &KeyMaterial, nonce: &[u8], ciphertext: &[u8], ad
     Ok(pt)
 }
 
+/// Lowercase hex rendering of `data`, two digits per byte. Compiled for tests only and shared by this crate's tests.
+#[cfg(test)]
+pub(crate) fn hex_encode(data: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(data.len() * 2);
+    for b in data {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 // Rust
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use hex::encode as hex_encode;
 
     // Use a reduced-cost KDF for fast tests
     fn small_kdf(salt: &[u8]) -> KdfParams {
@@ -368,7 +379,7 @@ mod tests {
         assert_eq!(k1.0.len(), 32);
         assert_eq!(k2.0.len(), 32);
         // Very likely different
-        assert_ne!(hex_encode(k1.0), hex_encode(k2.0));
+        assert_ne!(hex_encode(&k1.0), hex_encode(&k2.0));
     }
 
     #[test]
@@ -382,9 +393,9 @@ mod tests {
         let c = derive_key(master, &kdf2).unwrap();
 
         // Deterministic with same params
-        assert_eq!(hex_encode(a.0), hex_encode(b.0));
+        assert_eq!(hex_encode(&a.0), hex_encode(&b.0));
         // Different salt -> different key
-        assert_ne!(hex_encode(a.0), hex_encode(c.0));
+        assert_ne!(hex_encode(&a.0), hex_encode(&c.0));
     }
 
     #[test]
@@ -444,11 +455,11 @@ mod tests {
 
         // Unwrap with verifier ok
         let unwrapped = unwrap_vault_key(&master_derived, &wrapped, Some(&verifier)).unwrap();
-        assert_eq!(hex_encode(vk.0), hex_encode(unwrapped.0));
+        assert_eq!(hex_encode(&vk.0), hex_encode(&unwrapped.0));
 
         // Unwrap without verifier also ok
         let unwrapped2 = unwrap_vault_key(&master_derived, &wrapped, None).unwrap();
-        assert_eq!(hex_encode(vk.0), hex_encode(unwrapped2.0));
+        assert_eq!(hex_encode(&vk.0), hex_encode(&unwrapped2.0));
     }
 
     #[test]
@@ -510,7 +521,7 @@ mod tests {
         let (_, tag2) = wrap_vault_key(&md, &vk).unwrap();
 
         // HMAC is deterministic for the same key and data
-        assert_eq!(hex_encode(tag1), hex_encode(tag2));
+        assert_eq!(hex_encode(&tag1), hex_encode(&tag2));
     }
 
     #[test]
@@ -523,140 +534,67 @@ mod tests {
         let (_, tag1) = wrap_vault_key(&md1, &vk).unwrap();
         let (_, tag2) = wrap_vault_key(&md2, &vk).unwrap();
 
-        assert_ne!(hex_encode(tag1), hex_encode(tag2));
+        assert_ne!(hex_encode(&tag1), hex_encode(&tag2));
     }
 
-    // Helper: ensure hex codec available in tests
-    mod hex {
-        #[allow(clippy::format_collect)]
-        pub fn encode<T: AsRef<[u8]>>(data: T) -> String {
-            data.as_ref().iter().map(|b| format!("{b:02x}")).collect()
-        }
+    /// Comma-joined decimal rendering of `bytes` with no spaces, as derived `Debug` prints them once whitespace is
+    /// stripped.
+    fn decimal_rendering(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn test_keymaterial_debug_redacts_key_bytes() {
         let key1_bytes: [u8; 32] = [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
             30, 31, 32,
         ];
-        let key1 = KeyMaterial(key1_bytes);
-
         let key2_bytes: [u8; 32] = [
             201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221,
             222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232,
         ];
-        let key2 = KeyMaterial(key2_bytes);
+        let keys = [("key1", key1_bytes), ("key2", key2_bytes)];
 
-        let debug_compact_key1 = format!("{key1:?}");
-        let debug_pretty_key1 = format!("{key1:#?}");
-        let debug_compact_key2 = format!("{key2:?}");
-        let debug_pretty_key2 = format!("{key2:#?}");
-
-        assert_eq!(debug_compact_key1, "KeyMaterial(<redacted>)");
-        assert_eq!(debug_pretty_key1, "KeyMaterial(<redacted>)");
-        assert_eq!(debug_compact_key2, "KeyMaterial(<redacted>)");
-        assert_eq!(debug_pretty_key2, "KeyMaterial(<redacted>)");
-
-        assert_eq!(debug_compact_key1, debug_compact_key2);
-        assert_eq!(debug_pretty_key1, debug_pretty_key2);
-
-        let decimal1: String = key1_bytes
+        // (label, decimal rendering, hex rendering) for every key, checked against every output.
+        let renderings: Vec<(&str, String, String)> = keys
             .iter()
-            .map(std::string::ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let decimal2: String = key2_bytes
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let hex1 = hex::encode(key1_bytes);
-        let hex2 = hex::encode(key2_bytes);
+            .map(|(label, bytes)| (*label, decimal_rendering(bytes), hex_encode(bytes)))
+            .collect();
 
-        let output_no_ws_key1 = debug_compact_key1
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>();
-        assert!(
-            !output_no_ws_key1.contains(&decimal1),
-            "compact output must not contain decimal bytes"
-        );
-        assert!(
-            !output_no_ws_key1.contains(&decimal2),
-            "compact output must not contain decimal bytes from other key"
-        );
-        assert!(
-            !output_no_ws_key1.to_lowercase().contains(&hex1),
-            "compact output must not contain hex bytes"
-        );
-        assert!(
-            !output_no_ws_key1.to_lowercase().contains(&hex2),
-            "compact output must not contain hex bytes from other key"
-        );
+        let formats: [(&str, fn(&KeyMaterial) -> String); 2] =
+            [("compact", |k| format!("{k:?}")), ("pretty", |k| format!("{k:#?}"))];
 
-        let output_no_ws_key2 = debug_compact_key2
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>();
-        assert!(
-            !output_no_ws_key2.contains(&decimal1),
-            "compact output must not contain decimal bytes"
-        );
-        assert!(
-            !output_no_ws_key2.contains(&decimal2),
-            "compact output must not contain decimal bytes from other key"
-        );
-        assert!(
-            !output_no_ws_key2.to_lowercase().contains(&hex1),
-            "compact output must not contain hex bytes"
-        );
-        assert!(
-            !output_no_ws_key2.to_lowercase().contains(&hex2),
-            "compact output must not contain hex bytes from other key"
-        );
+        for (format_name, render) in formats {
+            let outputs: Vec<String> = keys.iter().map(|(_, bytes)| render(&KeyMaterial(*bytes))).collect();
 
-        let output_no_ws_pretty_key1 = debug_pretty_key1
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>();
-        assert!(
-            !output_no_ws_pretty_key1.contains(&decimal1),
-            "pretty output must not contain decimal bytes"
-        );
-        assert!(
-            !output_no_ws_pretty_key1.contains(&decimal2),
-            "pretty output must not contain decimal bytes from other key"
-        );
-        assert!(
-            !output_no_ws_pretty_key1.to_lowercase().contains(&hex1),
-            "pretty output must not contain hex bytes"
-        );
-        assert!(
-            !output_no_ws_pretty_key1.to_lowercase().contains(&hex2),
-            "pretty output must not contain hex bytes from other key"
-        );
+            for ((key_label, _), output) in keys.iter().zip(&outputs) {
+                assert_eq!(
+                    output, "KeyMaterial(<redacted>)",
+                    "{format_name} output for {key_label} must be exactly the redacted marker"
+                );
 
-        let output_no_ws_pretty_key2 = debug_pretty_key2
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>();
-        assert!(
-            !output_no_ws_pretty_key2.contains(&decimal1),
-            "pretty output must not contain decimal bytes"
-        );
-        assert!(
-            !output_no_ws_pretty_key2.contains(&decimal2),
-            "pretty output must not contain decimal bytes from other key"
-        );
-        assert!(
-            !output_no_ws_pretty_key2.to_lowercase().contains(&hex1),
-            "pretty output must not contain hex bytes"
-        );
-        assert!(
-            !output_no_ws_pretty_key2.to_lowercase().contains(&hex2),
-            "pretty output must not contain hex bytes from other key"
-        );
+                let no_ws: String = output.chars().filter(|c| !c.is_whitespace()).collect();
+                let no_ws_lower = no_ws.to_lowercase();
+                for (leaked_label, decimal, hex) in &renderings {
+                    assert!(
+                        !no_ws.contains(decimal.as_str()),
+                        "{format_name} output for {key_label} must not contain the decimal bytes of {leaked_label}"
+                    );
+                    assert!(
+                        !no_ws_lower.contains(hex.as_str()),
+                        "{format_name} output for {key_label} must not contain the hex bytes of {leaked_label}"
+                    );
+                }
+            }
+
+            assert_eq!(
+                outputs[0], outputs[1],
+                "{format_name} output must be identical for both keys"
+            );
+        }
     }
 }

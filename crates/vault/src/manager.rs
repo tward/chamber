@@ -359,6 +359,7 @@ mod tests {
     #![allow(unused_comparisons)]
 
     use super::*;
+    use crate::crypto::hex_encode;
     use crate::registry::{VaultCategory, VaultInfo, VaultRegistry};
     use crate::{BackupConfig, Item, ItemKind};
     use color_eyre::Result;
@@ -1017,6 +1018,60 @@ mod tests {
         assert!(manager.is_vault_open("legacy"));
         assert!(manager.get_vault("legacy").unwrap().is_unlocked());
         Ok(())
+    }
+
+    #[test]
+    fn test_isolated_vault_manager_debug_redacts_open_vault_key() {
+        let (mut manager, temp_dir) = create_isolated_vault_manager();
+        let master_password = "synthetic-debug-redaction-password";
+
+        let vault_id = manager
+            .create_vault(
+                "Debug Redaction Vault".to_string(),
+                Some(temp_dir.path().join("debug_redaction.db")),
+                VaultCategory::Personal,
+                None,
+                master_password,
+            )
+            .expect("Failed to create vault");
+        manager
+            .open_vault(&vault_id, master_password)
+            .expect("Failed to open vault");
+
+        let key_bytes: [u8; 32] = manager
+            .open_vaults
+            .get(&vault_id)
+            .expect("vault must be open")
+            .key
+            .as_ref()
+            .expect("open vault must be unlocked")
+            .0;
+        let decimal = key_bytes
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let hex = hex_encode(&key_bytes);
+
+        for (format_name, output) in [("compact", format!("{manager:?}")), ("pretty", format!("{manager:#?}"))] {
+            assert!(
+                output.contains("KeyMaterial(<redacted>)"),
+                "{format_name} output must show the redacted key placeholder"
+            );
+
+            let no_ws: String = output.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                !no_ws.contains(&decimal),
+                "{format_name} output must not contain the open vault's key as decimal bytes"
+            );
+            assert!(
+                !no_ws.to_lowercase().contains(&hex),
+                "{format_name} output must not contain the open vault's key as hex bytes"
+            );
+        }
+
+        drop(manager);
+        drop(temp_dir);
     }
 
     // BackupManager tests can also be isolated
