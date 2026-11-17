@@ -3,6 +3,7 @@ mod backup;
 mod health;
 mod resolve;
 mod stats;
+mod sync;
 #[cfg(test)]
 mod test_support;
 mod utils;
@@ -13,6 +14,7 @@ use crate::backup::{BackupCommand, handle_backup_command};
 use crate::health::{analyze_password_strength, handle_health_command};
 use crate::resolve::lookup_item_on_terminal;
 use crate::stats::handle_stats_command;
+use crate::sync::{SyncCommand, handle_sync_command};
 use crate::utils::{filter_and_sort_items, format_relative_time};
 use crate::vault::{VaultCommand, handle_vault_command};
 use chamber_import_export::{ExportFormat, detect_format_from_extension, export_items, import_items};
@@ -216,6 +218,23 @@ pub enum Commands {
     /// Multiple vault management commands for organizing secrets
     #[command(subcommand)]
     Registry(VaultCommand),
+
+    /// Synchronize this vault with your other machines through a sync directory
+    ///
+    /// Without a subcommand, unlocks the default vault once, merges the snapshot files in the
+    /// sync directory, then publishes this machine's snapshot. Exits with a non-zero status if
+    /// any snapshot file was skipped.
+    #[command(args_conflicts_with_subcommands = true)]
+    Sync {
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Sync directory to use (default: $CHAMBER_SYNC_DIR, then chamber/sync under the data directory)"
+        )]
+        dir: Option<PathBuf>,
+        #[command(subcommand)]
+        command: Option<SyncCommand>,
+    },
 }
 
 /// Handles various commands related to a vault system, including initialization,
@@ -695,6 +714,7 @@ pub async fn handle_command(cmd: Commands) -> Result<()> {
             let mut manager = VaultManager::new()?;
             handle_vault_command(&mut manager, registry_cmd)?;
         }
+        Commands::Sync { dir, command } => handle_sync_command(dir.as_deref(), command.as_ref())?,
     }
     Ok(())
 }
