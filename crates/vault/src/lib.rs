@@ -9,11 +9,12 @@ pub mod merge;
 pub mod names;
 mod registry;
 pub mod revision;
+pub mod snapshot;
 
 // Re-export commonly used types and functions for easier access
 pub use crypto::{
-    HmacSha256, KdfParams, KeyMaterial, WrappedVaultKey, aead_decrypt, aead_encrypt, derive_key, unwrap_vault_key,
-    wrap_vault_key,
+    HmacSha256, KdfParams, KeyMaterial, WrappedVaultKey, aead_decrypt, aead_encrypt, derive_key, hkdf_sha256,
+    unwrap_vault_key, wrap_vault_key,
 };
 
 pub use clock::{Clock, ManualClock, SystemClock};

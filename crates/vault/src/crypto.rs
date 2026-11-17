@@ -341,6 +341,61 @@ pub fn aead_decrypt(vault_key: &KeyMaterial, nonce: &[u8], ciphertext: &[u8], ad
     Ok(pt)
 }
 
+/// The length of an HMAC-SHA-256 output, and so of an HKDF-SHA-256 pseudorandom key and output block.
+const SHA256_LEN: usize = 32;
+
+/// The longest output [`hkdf_sha256`] can produce: 255 blocks of 32 bytes (RFC 5869, section 2.3).
+pub const HKDF_SHA256_MAX_OUTPUT: usize = 255 * SHA256_LEN;
+
+/// HKDF-SHA-256 as specified in RFC 5869: extracts a pseudorandom key from `ikm` with `salt`, then
+/// expands it with `info` to fill `okm` completely.
+///
+/// An empty `salt` behaves as the RFC's default of 32 zero bytes: HMAC pads a key shorter than the
+/// hash block with zeros, so the two produce the same pseudorandom key.
+///
+/// The intermediate pseudorandom key and output blocks are zeroized before returning.
+///
+/// # Errors
+/// Returns an error, leaving `okm` unchanged, when `okm` is longer than
+/// [`HKDF_SHA256_MAX_OUTPUT`] bytes.
+pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], okm: &mut [u8]) -> Result<()> {
+    if okm.len() > HKDF_SHA256_MAX_OUTPUT {
+        return Err(eyre!(
+            "HKDF-SHA-256 output of {} bytes exceeds the limit of {HKDF_SHA256_MAX_OUTPUT} bytes",
+            okm.len()
+        ));
+    }
+
+    // Extract: PRK = HMAC-Hash(salt, IKM).
+    let mut extract = <HmacSha256 as Mac>::new_from_slice(salt)?;
+    extract.update(ikm);
+    let mut prk = [0u8; SHA256_LEN];
+    prk.copy_from_slice(&extract.finalize().into_bytes());
+
+    let result = hkdf_sha256_expand(&prk, info, okm);
+    prk.zeroize();
+    result
+}
+
+/// The expand step of HKDF-SHA-256: `T(i) = HMAC-Hash(PRK, T(i-1) | info | i)`, with `T(0)` empty,
+/// concatenated and truncated to the length of `okm`. The caller has checked that length.
+fn hkdf_sha256_expand(prk: &[u8; SHA256_LEN], info: &[u8], okm: &mut [u8]) -> Result<()> {
+    let mut block = [0u8; SHA256_LEN];
+    let mut block_len = 0;
+    for (index, chunk) in okm.chunks_mut(SHA256_LEN).enumerate() {
+        let counter = u8::try_from(index + 1)?;
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(prk)?;
+        mac.update(&block[..block_len]);
+        mac.update(info);
+        mac.update(&[counter]);
+        block.copy_from_slice(&mac.finalize().into_bytes());
+        block_len = SHA256_LEN;
+        chunk.copy_from_slice(&block[..chunk.len()]);
+    }
+    block.zeroize();
+    Ok(())
+}
+
 /// Lowercase hex rendering of `data`, two digits per byte. Compiled for tests only and shared by this crate's tests.
 #[cfg(test)]
 pub(crate) fn hex_encode(data: &[u8]) -> String {
@@ -356,6 +411,94 @@ pub(crate) fn hex_encode(data: &[u8]) -> String {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    fn hex_decode(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Runs one RFC 5869 test case and checks the output keying material.
+    fn check_hkdf_case(ikm: &[u8], salt: &[u8], info: &[u8], len: usize, expected_okm: &str) {
+        let mut okm = vec![0u8; len];
+        hkdf_sha256(salt, ikm, info, &mut okm).unwrap();
+        assert_eq!(hex_encode(&okm), expected_okm);
+    }
+
+    #[test]
+    fn test_hkdf_sha256_rfc5869_test_case_1() {
+        // RFC 5869, Appendix A.1: basic test case with SHA-256.
+        check_hkdf_case(
+            &hex_decode("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"),
+            &hex_decode("000102030405060708090a0b0c"),
+            &hex_decode("f0f1f2f3f4f5f6f7f8f9"),
+            42,
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
+        );
+    }
+
+    #[test]
+    fn test_hkdf_sha256_rfc5869_test_case_2() {
+        // RFC 5869, Appendix A.2: longer inputs and outputs with SHA-256.
+        check_hkdf_case(
+            &hex_decode(
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
+                 202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f\
+                 404142434445464748494a4b4c4d4e4f",
+            ),
+            &hex_decode(
+                "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f\
+                 808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f\
+                 a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+            ),
+            &hex_decode(
+                "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf\
+                 d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeef\
+                 f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+            ),
+            82,
+            "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c\
+             59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71\
+             cc30c58179ec3e87c14c01d5c1f3434f1d87",
+        );
+    }
+
+    #[test]
+    fn test_hkdf_sha256_rfc5869_test_case_3() {
+        // RFC 5869, Appendix A.3: zero-length salt and info with SHA-256.
+        check_hkdf_case(
+            &hex_decode("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"),
+            &[],
+            &[],
+            42,
+            "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8",
+        );
+    }
+
+    #[test]
+    fn test_hkdf_sha256_output_length_limit() {
+        let mut max = vec![0u8; HKDF_SHA256_MAX_OUTPUT];
+        hkdf_sha256(b"salt", b"ikm", b"info", &mut max).unwrap();
+        assert!(max.iter().any(|&b| b != 0));
+
+        let mut too_long = vec![0u8; HKDF_SHA256_MAX_OUTPUT + 1];
+        assert!(hkdf_sha256(b"salt", b"ikm", b"info", &mut too_long).is_err());
+        assert!(
+            too_long.iter().all(|&b| b == 0),
+            "a rejected call leaves the output unchanged"
+        );
+    }
+
+    #[test]
+    fn test_hkdf_sha256_prefix_consistent_across_lengths() {
+        // Expansion is a stream of blocks: a shorter output is a prefix of a longer one.
+        let mut short = [0u8; 20];
+        let mut long = [0u8; 70];
+        hkdf_sha256(b"salt", b"ikm", b"info", &mut short).unwrap();
+        hkdf_sha256(b"salt", b"ikm", b"info", &mut long).unwrap();
+        assert_eq!(short, long[..20]);
+    }
 
     // Use a reduced-cost KDF for fast tests
     fn small_kdf(salt: &[u8]) -> KdfParams {
