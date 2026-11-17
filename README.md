@@ -21,6 +21,7 @@ and other secrets with strong cryptographic guarantees.
 - **📊 Multiple Export Formats**: JSON, CSV, and Chamber Backup formats with robust parsing
 - **🔄 Backup**: a comprehensive backup system that ensures your sensitive data is automatically protected
 - **🔄 Import/Export**: Seamless data migration and backup capabilities
+- **🔁 Offline Synchronization**: Keep your default vault in step across machines through encrypted snapshot files
 - **🏷️ Flexible Item Types**: Support for passwords, environment variables, API keys, SSH keys, certificates, and more
 - **🛡️ Security-First Design**: Zero-knowledge architecture with local-only storage
 
@@ -58,6 +59,7 @@ and other secrets with strong cryptographic guarantees.
 - [Development Setup](#-development-setup)
 - [Architecture](#-architecture)
 - [Usage](#-usage)
+- [Offline Synchronization](#offline-synchronization)
 - [Testing](#-testing)
 - [Security](#-security)
 - [Contributing](#-contributing)
@@ -1601,6 +1603,214 @@ By default, Chamber stores vault files in:
 - **macOS**: `~/Library/Application Support/chamber/vaults/`
 - **Linux**: `~/.chamber/vaults/`
 
+## Offline Synchronization
+
+Chamber can keep the default vault in step across several of your machines without a server. Every enrolled
+machine holds a complete local vault and can read, create, edit, and delete entries while offline. Machines exchange
+encrypted snapshot files and merge them on arrival. No machine is a server or a permanent authority.
+
+Chamber owns the directory layout, the file format, encryption, validation, publication, and merging. The transport
+only moves files and never receives a key, so Syncthing, SCP, an external disk, or copying files by hand all give the
+same result.
+
+Publishing and merging are manual: nothing runs automatically. Files can arrive in the sync directory while Chamber
+is locked or not running, but publishing and merging need the vault unlocked, so each command asks for the master key.
+
+```mermaid
+flowchart LR
+    DBA[(Machine A local vault)] <-->|publish and merge| DIRA[Machine A sync directory]
+    DIRA <-->|any transport| DIRB[Machine B sync directory]
+    DIRB <-->|publish and merge| DBB[(Machine B local vault)]
+```
+
+### 🔄 Sync Commands
+
+| Command | What it does |
+|---------|--------------|
+| `chamber sync` | Unlocks once, merges the snapshot files in the sync directory, then publishes this machine's snapshot |
+| `chamber sync merge` | Merges the snapshot files other machines published |
+| `chamber sync publish` | Publishes this machine's snapshot to the sync directory |
+| `chamber sync enroll <output-path>` | Writes an enrollment package that lets another machine join this vault |
+| `chamber sync join <package-path>` | Joins an existing vault from an enrollment package |
+
+`chamber sync`, `chamber sync merge`, and `chamber sync publish` accept `--dir <path>` to choose the sync directory:
+
+```bash
+# Merge, then publish, using the default sync directory
+chamber sync
+
+# The same, with an explicit sync directory
+chamber sync --dir /mnt/usb-stick/chamber-sync
+
+# Only merge, or only publish
+chamber sync merge --dir ~/Sync/chamber
+chamber sync publish --dir ~/Sync/chamber
+```
+
+Bare `chamber sync` always publishes, even when some files were skipped during the merge, so the published snapshot
+includes everything that was merged. It then exits with a non-zero status if any file was skipped.
+
+The sync commands work on the default vault, the one `chamber get`, `chamber list`, and `chamber add` use. Other
+vaults in the registry are not synchronized.
+
+### 📁 The Sync Directory
+
+The sync directory is chosen in this order:
+
+1. `--dir <path>`
+2. The `CHAMBER_SYNC_DIR` environment variable (an empty value counts as unset)
+3. `chamber/sync` under the platform data directory, which is `~/.local/share/chamber/sync` on Linux
+
+The directory is not stored as a setting, so pass the same `--dir` or set the same variable every time.
+`chamber sync publish` creates the directory if it does not exist.
+
+What lives in it:
+
+- Each machine publishes exactly one file, `<device-id>.chsnap`, holding its complete state, for example
+  `3f2b9c1e-7a4d-4e8b-9c0a-5d6e7f8a9b0c.chsnap`. Each publication replaces the previous file, and earlier files are
+  never needed.
+- A merge reads the regular files directly in the directory whose names end in `.chsnap` and do not start with a dot.
+  That includes conflict copies a transport makes (they keep the `.chsnap` ending) and excludes temporary files
+  (which start with a dot). Subdirectories and symbolic links are not read.
+- The working database must not be inside the sync directory. The commands refuse a sync directory that contains the
+  vault's database file. Never synchronize the live SQLite database or its WAL files.
+- The directory and the snapshot files get default permissions, so a transport running under another account can read
+  and write them. Snapshot payloads are encrypted, so no entry is readable without the vault key.
+
+### 🚀 Getting Started with Sync
+
+#### Existing Vaults Are Migrated Once
+
+Opening an existing vault with this version of Chamber migrates it to schema version 1 automatically, without
+unlocking, in one transaction. The migration gives the vault, this machine, and every entry a permanent identity.
+There is no downgrade. A vault whose schema version is newer than the binary supports is refused with a message to
+update Chamber.
+
+> **Migrate an existing vault on exactly one machine.** Every other machine joins by enrollment. Two copies migrated
+> independently get different identities, are different vaults, and reject each other's snapshots.
+
+#### Adding a Second Machine
+
+On the first machine, the one that already has the vault (run `chamber init` first if it has none), write an
+enrollment package:
+
+```bash
+chamber sync enroll ~/chamber-laptop.chenroll
+```
+
+The file name must end in `.chenroll`, and nothing may exist at the path yet. Chamber asks for the master key, writes
+the package (readable by your account only, where the platform supports it), and shows a transfer secret once:
+
+```text
+Wrote the enrollment package to /home/user/chamber-laptop.chenroll.
+
+Transfer secret: XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XX
+
+This secret is shown only once. Send it to the other machine separately from the package: ...
+```
+
+Move the package to the second machine by any means, including the sync directory. Convey the transfer secret
+separately, for example by reading it aloud or typing it in by hand, never through the same channel as the package.
+
+On the second machine, whose default vault must not be initialized (do not run `chamber init` there), join:
+
+```bash
+chamber sync join ~/Downloads/chamber-laptop.chenroll
+```
+
+Chamber asks for the transfer secret, shows the vault UUID and the number of entries the package carries, and asks
+`Join this vault? [y/N]`. Check that the entry count matches the vault on the first machine, answer `y`, and choose a
+new local master password for this machine (entered twice). Any other answer cancels and changes nothing. After a
+successful join, delete the package and discard the transfer secret.
+
+From then on, run `chamber sync` on each machine whenever files arrive in its sync directory.
+
+Machines may use different master passwords: each wraps the same shared vault key under its own password.
+
+### ⚖️ How Merging Decides
+
+- **Identity**: entries are matched by a permanent UUID, never by name or row number.
+- **Newer revision wins**: when two machines hold different live versions of an entry, the one with the newer revision
+  wins as a whole entry. Fields are not combined. Ties are broken deterministically, so every machine picks the same
+  winner.
+- **Deletion wins**: a deletion always wins for an entry, even against a later offline edit on another machine.
+  Deletion records (tombstones) are kept forever. There is no undelete, and creating an entry again under the same name
+  gives it a new identity.
+- **Absence is not deletion**: a missing file, or an entry missing from a file, never deletes anything.
+- **Receiving is not editing**: a merged entry keeps the revision it arrived with. Duplicate, delayed, and out-of-order
+  files are safe to merge, and merging the same file twice changes nothing.
+- **Backup restore propagates**: `chamber backup restore` deletes every entry and creates the restored ones as new
+  entries. Once that reaches the other machines, the restored set replaces the old one everywhere. This is intended.
+- **Clocks**: a revision is the machine's wall clock time plus a counter. Clock skew is not corrected. The guarantee is
+  that all machines agree on the winner, not that the winner is the most recent real edit. A machine whose clock is far
+  in the future pushes later revisions forward on every machine that imports from it.
+
+### 🏷️ Entries That Share a Name
+
+Merging can leave several entries with the same name, for example when two offline machines each created
+`github-token`. All of them are kept and none is renamed.
+
+- `chamber list` and the TUI list show such entries as `name (1a2b3c4d)`, where the suffix is the first 8 hexadecimal
+  characters of the entry UUID. An entry whose name is unique is shown by its bare name.
+- `chamber get` and `chamber update` never guess. On an interactive terminal they show a numbered list of the matches
+  (UUID suffix, type, and last update time) and ask which one you mean. Otherwise they fail and list the matches.
+- Creating an entry locally under a name that already exists is still refused.
+
+### 📋 Reading the Report
+
+Each merged file is reported with counts of entries added, replaced, removed by a tombstone, and unchanged. Each
+skipped file is reported with its specific reason. A skipped file never stops the other files and is never partly
+applied.
+
+```text
+Merged 3f2b9c1e-7a4d-4e8b-9c0a-5d6e7f8a9b0c.chsnap: 2 added, 1 replaced, 0 removed by a tombstone, 14 unchanged
+Skipped 9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a.chsnap: The snapshot belongs to another vault, so it was not merged. ...
+Published /home/user/.local/share/chamber/sync/5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d.chsnap: 17 entries, 3 tombstones (snapshot 0f1e2d3c-4b5a-4968-8776-655443322110)
+```
+
+Common reasons for a skipped file:
+
+- **Another vault's file**: the snapshot belongs to a different vault, for example a copy that was migrated
+  independently instead of enrolled.
+- **Damaged, incomplete, or wrong key**: the file could not be decrypted. If a transport is still copying it, run the
+  merge again once the copy finishes; otherwise publish it again from the machine that made it.
+- **Too large**: the file is over the 64 MiB limit and is rejected without being merged.
+- **Newer format version**: the file was written by a newer Chamber. Update Chamber on this machine.
+
+Reports show file names, counts, and reasons. They never include entry names or secrets.
+
+### 📦 File Format Summary
+
+- **Snapshot**: a fixed 83-byte header (magic `CHMBSNAP`, format version, package type, vault UUID, publisher device
+  ID, snapshot ID, nonce) followed by a JSON payload encrypted with XChaCha20-Poly1305, with the whole header
+  authenticated as associated data.
+- **Snapshot key**: HKDF-SHA-256 of the vault key, with the vault UUID as salt.
+- **Enrollment package**: the same kind of file, encrypted under a key derived by HKDF-SHA-256 from the 128-bit
+  transfer secret and a random salt. It carries the vault state and, in addition, the vault key.
+- **Item values** travel as they are already stored, with their existing per-item encryption. Publishing and merging
+  never decrypt a secret value and never write plaintext to disk.
+- **Visible without the key**: the file size, when files appear, the vault UUID, the publisher device ID, and the
+  snapshot ID.
+
+### 🛡️ Security Boundaries and Limits
+
+- **Enrolled machines are fully trusted**: every enrolled machine can read all secrets and make any change, including
+  deletions. Device IDs are identifiers, not credentials. A valid file proves possession of the shared key, not which
+  device wrote it.
+- **The transport alone grants nothing**: possessing the sync directory or the transport grants neither decryption nor
+  forgery.
+- **The package plus the transfer secret grants full membership**: the secret is temporary by usage, not single-use. A
+  retained package and secret can be used again, so delete the package and discard the secret after joining.
+- **No revocation**: Chamber cannot revoke a machine and does not rotate the vault key. Changing a master password, or
+  deleting a machine's snapshot file, revokes nothing.
+- **The transport can withhold, replay, or delete files**: Chamber rejects invalid contents and merges stale state
+  safely, but it cannot know that newer state exists elsewhere.
+- **Deletions propagate only when received**: they cannot erase disconnected copies or old backups.
+- **Synchronization is not a backup**: it propagates valid deletions to every machine. Keep independent backups (see
+  [Chamber Backup System](#chamber-backup-system)).
+- **CLI only**: synchronization is available through the CLI. The TUI has no synchronization actions and the REST API
+  has no synchronization endpoints.
+
 ## 🧪 Testing
 Chamber includes comprehensive test coverage across all components:
 ### Running Tests
@@ -1643,6 +1853,9 @@ cargo run --bin chamber --features profiling
 - **Key Derivation**: Argon2id with minimum 64MB memory, 3 iterations
 - **Encryption**: ChaCha20-Poly1305 with 256-bit keys and 96-bit nonces
 - **Authentication**: HMAC-SHA256 for integrity verification
+- **Snapshot Key**: HKDF-SHA-256 of the vault key, with the vault UUID as salt, for synchronization snapshots
+- **Enrollment Key**: HKDF-SHA-256 of the 128-bit transfer secret and a random per-package salt
+- **Sync File Encryption**: XChaCha20-Poly1305 with 256-bit keys and 192-bit nonces, whole header authenticated
 - **Random Number Generation**: OS-provided entropy via `getrandom`
 
 ### Security Best Practices
