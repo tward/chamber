@@ -11,6 +11,7 @@ pub mod names;
 mod registry;
 pub mod revision;
 pub mod snapshot;
+pub mod sync_dir;
 
 // Re-export commonly used types and functions for easier access
 pub use crypto::{
@@ -23,6 +24,10 @@ pub use db::{Db, ItemRow, SCHEMA_VERSION};
 pub use merge::{MergeCounts, SyncEntry, SyncState, content_digest};
 pub use names::{SHORT_UUID_LEN, display_name, shared_names, short_uuid};
 pub use revision::{HighWaterMark, Revision, RevisionSpaceExhausted, next_local_revision, unix_millis};
+pub use sync_dir::{
+    FileOutcome, FileReport, MergeReport, PublishReport, SNAPSHOT_EXTENSION, SYNC_DIR_ENV, SyncDirError,
+    default_sync_dir, resolve_sync_dir, snapshot_file_name,
+};
 pub use uuid::Uuid;
 
 pub use crate::autolock::AutoLockConfig;
