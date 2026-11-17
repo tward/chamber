@@ -76,10 +76,10 @@ pub struct Db {
 }
 
 /// The contents of the single `sync_meta` row.
-struct SyncMeta {
-    vault_uuid: Uuid,
-    device_id: Uuid,
-    hwm: HighWaterMark,
+pub(crate) struct SyncMeta {
+    pub(crate) vault_uuid: Uuid,
+    pub(crate) device_id: Uuid,
+    pub(crate) hwm: HighWaterMark,
 }
 
 impl Db {
@@ -131,8 +131,15 @@ impl Db {
 
     /// Begins a transaction that takes the write lock up front, for writes that read state
     /// (such as the high-water mark) before writing.
-    fn write_transaction(&self) -> rusqlite::Result<Transaction<'_>> {
+    pub(crate) fn write_transaction(&self) -> rusqlite::Result<Transaction<'_>> {
         Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+    }
+
+    /// Begins a read transaction. In WAL mode every read inside it sees one snapshot of the
+    /// database, taken at its first read, so a write committed by another connection meanwhile
+    /// is either wholly visible or not at all.
+    pub(crate) fn read_transaction(&self) -> rusqlite::Result<Transaction<'_>> {
+        Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)
     }
 
     /// Returns this vault's UUID, minted when the database was created or migrated.
@@ -455,11 +462,7 @@ impl Db {
     /// # Errors
     /// Returns an error if the query fails or a stored tombstone is not a 16-byte blob.
     pub fn tombstones(&self) -> Result<Vec<Uuid>> {
-        let mut stmt = self.conn.prepare("SELECT uuid FROM tombstones ORDER BY uuid ASC")?;
-        let uuids = stmt
-            .query_map([], |r| Ok(Uuid::from_bytes(r.get::<_, [u8; 16]>(0)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(uuids)
+        read_tombstones(&self.conn)
     }
 
     /// Updates an item with new encrypted data and assigns it a new revision.
@@ -614,8 +617,17 @@ fn seed_existing_items(conn: &Connection, device_id: Uuid) -> Result<HighWaterMa
     Ok(hwm)
 }
 
+/// Reads every tombstone, ascending by bytes (`SQLite` compares blobs with `memcmp`).
+pub(crate) fn read_tombstones(conn: &Connection) -> Result<Vec<Uuid>> {
+    let mut stmt = conn.prepare("SELECT uuid FROM tombstones ORDER BY uuid ASC")?;
+    let uuids = stmt
+        .query_map([], |r| Ok(Uuid::from_bytes(r.get::<_, [u8; 16]>(0)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(uuids)
+}
+
 /// Reads the single `sync_meta` row.
-fn read_sync_meta(conn: &Connection) -> Result<SyncMeta> {
+pub(crate) fn read_sync_meta(conn: &Connection) -> Result<SyncMeta> {
     let meta = conn.query_row(
         "SELECT vault_uuid, device_id, hwm_wall_ms, hwm_counter FROM sync_meta WHERE id = 1",
         [],
@@ -634,7 +646,7 @@ fn read_sync_meta(conn: &Connection) -> Result<SyncMeta> {
 }
 
 /// Stores `hwm` as the high-water mark.
-fn write_high_water_mark(conn: &Connection, hwm: HighWaterMark) -> Result<()> {
+pub(crate) fn write_high_water_mark(conn: &Connection, hwm: HighWaterMark) -> Result<()> {
     let changed = conn.execute(
         "UPDATE sync_meta SET hwm_wall_ms = ?1, hwm_counter = ?2 WHERE id = 1",
         params![wall_ms_to_sql(hwm.wall_ms), hwm.counter],
@@ -655,17 +667,17 @@ fn new_random_uuid() -> Result<Uuid> {
 
 /// `SQLite` integers are signed, so a `u64` `wall_ms` is stored with its bits reinterpreted
 /// as an `i64`. The full `u64` range round-trips; revisions are never compared in SQL.
-const fn wall_ms_to_sql(wall_ms: u64) -> i64 {
+pub(crate) const fn wall_ms_to_sql(wall_ms: u64) -> i64 {
     i64::from_ne_bytes(wall_ms.to_ne_bytes())
 }
 
 /// The inverse of [`wall_ms_to_sql`].
-const fn wall_ms_from_sql(stored: i64) -> u64 {
+pub(crate) const fn wall_ms_from_sql(stored: i64) -> u64 {
     u64::from_ne_bytes(stored.to_ne_bytes())
 }
 
 /// Parses a stored RFC 3339 timestamp from column `idx`.
-fn parse_timestamp(idx: usize, text: &str) -> rusqlite::Result<OffsetDateTime> {
+pub(crate) fn parse_timestamp(idx: usize, text: &str) -> rusqlite::Result<OffsetDateTime> {
     OffsetDateTime::parse(text, &Rfc3339)
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e)))
 }

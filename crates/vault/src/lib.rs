@@ -5,6 +5,7 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 mod manager;
+pub mod merge;
 mod registry;
 pub mod revision;
 
@@ -16,6 +17,7 @@ pub use crypto::{
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use db::{Db, ItemRow, SCHEMA_VERSION};
+pub use merge::{MergeCounts, SyncEntry, SyncState, content_digest};
 pub use revision::{HighWaterMark, Revision, RevisionSpaceExhausted, next_local_revision, unix_millis};
 pub use uuid::Uuid;
 
@@ -683,6 +685,37 @@ impl Vault {
     /// Returns an error if the database cannot be read.
     pub fn tombstones(&self) -> Result<Vec<Uuid>> {
         self.db.tombstones()
+    }
+
+    /// Returns this vault's complete synchronization state: every entry exactly as stored
+    /// (still encrypted) and every tombstone, read consistently. See [`Db::export_sync_state`].
+    ///
+    /// The key is not used beyond requiring an unlocked vault: nothing is decrypted.
+    ///
+    /// # Errors
+    /// Returns `eyre!("Locked")` on a locked vault, before the database is touched, and
+    /// otherwise any error from [`Db::export_sync_state`].
+    pub fn export_sync_state(&self) -> Result<SyncState> {
+        if self.key.is_none() {
+            return Err(eyre!("Locked"));
+        }
+        self.db.export_sync_state()
+    }
+
+    /// Merges another copy's synchronization state into this vault in one transaction and
+    /// reports what changed. See [`Db::merge_sync_state`] for the rules.
+    ///
+    /// The key is not used beyond requiring an unlocked vault: carried ciphertexts are stored
+    /// as they are, without being decrypted or re-encrypted, and the clock is not read.
+    ///
+    /// # Errors
+    /// Returns `eyre!("Locked")` on a locked vault, before the database is touched, and
+    /// otherwise any error from [`Db::merge_sync_state`], in which case nothing is changed.
+    pub fn merge_sync_state(&mut self, state: &SyncState) -> Result<MergeCounts> {
+        if self.key.is_none() {
+            return Err(eyre!("Locked"));
+        }
+        self.db.merge_sync_state(state)
     }
 
     /// Changes the master key for the vault.
@@ -1821,6 +1854,128 @@ mod lib_module_tests {
         assert_eq!(v.tombstones()?, expected);
         assert_eq!(v.list_items()?.len(), 1);
         assert_eq!(listed(&v, "b").name, "b");
+        Ok(())
+    }
+
+    // ---- Synchronization state ----
+
+    #[test]
+    fn test_sync_state_methods_require_unlock() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, _clock) = manual_vault(&dir, t0)?;
+        v.create_item(&new_note("a"))?;
+        let item = listed(&v, "a");
+        let hwm = v.high_water_mark()?;
+        v.lock();
+
+        assert_eq!(v.export_sync_state().unwrap_err().to_string(), "Locked");
+        let state = SyncState {
+            entries: vec![SyncEntry {
+                uuid: Uuid::from_bytes([0x77; 16]),
+                name: "b".into(),
+                kind: "note".into(),
+                nonce: vec![0; 24],
+                ciphertext: vec![1, 2, 3],
+                created_at: t0,
+                updated_at: t0,
+                revision: Revision {
+                    wall_ms: u64::MAX,
+                    counter: 0,
+                    device_id: Uuid::from_bytes([0x88; 16]),
+                },
+            }],
+            tombstones: vec![item.uuid],
+        };
+        assert_eq!(v.merge_sync_state(&state).unwrap_err().to_string(), "Locked");
+
+        // Nothing was touched: the item, the tombstones, and the high-water mark are as before.
+        assert!(v.tombstones()?.is_empty());
+        assert_eq!(v.high_water_mark()?, hwm);
+        v.unlock("m")?;
+        let items = v.list_items()?;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].uuid, item.uuid);
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_stores_ciphertext_it_cannot_decrypt() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, _clock) = manual_vault(&dir, t0)?;
+        let foreign = SyncEntry {
+            uuid: Uuid::from_bytes([0x42; 16]),
+            name: "foreign".into(),
+            kind: "note".into(),
+            nonce: vec![0x13; 24],
+            ciphertext: b"sealed under another vault's key".to_vec(),
+            created_at: t0,
+            updated_at: t0,
+            revision: Revision {
+                wall_ms: 1_000,
+                counter: 0,
+                device_id: Uuid::from_bytes([0x99; 16]),
+            },
+        };
+        let state = SyncState {
+            entries: vec![foreign],
+            tombstones: vec![],
+        };
+
+        let counts = v.merge_sync_state(&state)?;
+        assert_eq!(
+            counts,
+            MergeCounts {
+                added: 1,
+                ..MergeCounts::default()
+            }
+        );
+        assert_eq!(v.export_sync_state()?, state);
+        assert!(
+            v.list_items().is_err(),
+            "the local key cannot decrypt the carried entry"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_entry_copied_under_new_uuid_decrypts_alongside_original() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, _clock) = manual_vault(&dir, t0)?;
+        v.create_item(&NewItem {
+            name: "shared".into(),
+            kind: ItemKind::Password,
+            value: "s3cret".into(),
+        })?;
+
+        let exported = v.export_sync_state()?;
+        assert_eq!(exported.entries.len(), 1);
+        let original = exported.entries[0].clone();
+        let copy = SyncEntry {
+            uuid: Uuid::from_bytes([0xC0; 16]),
+            ..original.clone()
+        };
+        assert_ne!(copy.uuid, original.uuid);
+        let counts = v.merge_sync_state(&SyncState {
+            entries: vec![copy.clone()],
+            tombstones: vec![],
+        })?;
+        assert_eq!(counts.added, 1);
+
+        let items = v.list_items()?;
+        assert_eq!(items.len(), 2);
+        let mut uuids: Vec<Uuid> = items.iter().map(|i| i.uuid).collect();
+        uuids.sort_by_key(|u| *u.as_bytes());
+        let mut expected = vec![original.uuid, copy.uuid];
+        expected.sort_by_key(|u| *u.as_bytes());
+        assert_eq!(uuids, expected);
+        for item in &items {
+            assert_eq!(item.name, "shared");
+            assert_eq!(item.kind, ItemKind::Password);
+            assert_eq!(item.value, "s3cret");
+        }
         Ok(())
     }
 }
