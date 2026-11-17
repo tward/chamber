@@ -5,7 +5,7 @@
 //! [`ManualClock`]. Production code uses [`SystemClock`].
 
 use std::sync::{Mutex, PoisonError};
-use time::{Duration, OffsetDateTime};
+use time::{Duration, OffsetDateTime, UtcOffset};
 
 /// A source of the current UTC time.
 ///
@@ -33,19 +33,28 @@ impl Clock for SystemClock {
 /// `Vault` holds another handle to the same clock: every `set` or `advance` through either
 /// handle is seen by the other. Setting a time earlier than the current one is allowed, which
 /// lets tests simulate a clock rollback.
+///
+/// Every reading is in UTC. A time given with another offset, to [`ManualClock::new`] or
+/// [`ManualClock::set`], is stored as given and read back as the same instant in UTC.
+///
+/// # Panics
+/// Reading panics only if the stored instant cannot be expressed in UTC, which can happen only
+/// at the very edge of the range `OffsetDateTime` represents.
 #[derive(Debug)]
 pub struct ManualClock {
     now: Mutex<OffsetDateTime>,
 }
 
 impl ManualClock {
-    /// Creates a clock that reads `start` until it is set or advanced.
+    /// Creates a clock that reads the instant `start`, in UTC, until it is set or advanced.
     #[must_use]
     pub const fn new(start: OffsetDateTime) -> Self {
         Self { now: Mutex::new(start) }
     }
 
-    /// Sets the clock to `time`, which may be earlier than the current reading.
+    /// Sets the clock to the instant `time`, which may be earlier than the current reading.
+    ///
+    /// Later readings return that instant in UTC, whatever offset `time` carries.
     pub fn set(&self, time: OffsetDateTime) {
         *self.lock() = time;
     }
@@ -68,7 +77,8 @@ impl ManualClock {
 
 impl Clock for ManualClock {
     fn now_utc(&self) -> OffsetDateTime {
-        *self.lock()
+        let now = *self.lock();
+        now.to_offset(UtcOffset::UTC)
     }
 }
 
@@ -112,6 +122,29 @@ mod tests {
 
         clock.advance(Duration::seconds(-59));
         assert_eq!(other.now_utc(), datetime!(2025-12-31 23:59:00 UTC));
+    }
+
+    #[test]
+    fn test_manual_clock_reads_non_utc_input_as_utc() {
+        let start = datetime!(2026-01-02 05:04:05 +02:00);
+        let clock = ManualClock::new(start);
+        let reading = clock.now_utc();
+        assert_eq!(reading.offset(), UtcOffset::UTC);
+        assert_eq!(reading, start);
+        assert_eq!(reading, datetime!(2026-01-02 03:04:05 UTC));
+
+        let later = datetime!(2026-06-01 10:30:00 +02:00);
+        clock.set(later);
+        let reading = clock.now_utc();
+        assert_eq!(reading.offset(), UtcOffset::UTC);
+        assert_eq!(reading, later);
+        assert_eq!(reading, datetime!(2026-06-01 08:30:00 UTC));
+
+        // Advancing after a non-UTC `set` still reads in UTC and moves by exactly the duration.
+        clock.advance(Duration::seconds(90));
+        let reading = clock.now_utc();
+        assert_eq!(reading.offset(), UtcOffset::UTC);
+        assert_eq!(reading, datetime!(2026-06-01 08:31:30 UTC));
     }
 
     #[test]
