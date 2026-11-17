@@ -742,17 +742,10 @@ mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
     use crate::{KdfParams, WrappedVaultKey};
-    use std::fs;
     use time::macros::datetime;
 
     /// A fixed write time for tests that do not care about the exact value.
     const T0: OffsetDateTime = datetime!(2026-03-04 05:06:07.123_456_789 UTC);
-
-    fn tmp_path(name: &str) -> std::path::PathBuf {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
-        let pid = std::process::id();
-        std::env::temp_dir().join(format!("chamber_db_{name}_{pid}_{now}.sqlite3"))
-    }
 
     fn mk_wrapped(bytes: u8) -> WrappedVaultKey {
         WrappedVaultKey {
@@ -772,7 +765,8 @@ mod tests {
 
     #[test]
     fn test_open_and_migrate_and_is_meta_empty() -> Result<()> {
-        let path = tmp_path("open_migrate");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("open_migrate.sqlite3");
         let db = Db::open(&path)?;
         assert!(db.is_meta_empty()?);
 
@@ -780,27 +774,26 @@ mod tests {
         let db2 = Db::open(&path)?;
         assert!(db2.is_meta_empty()?);
 
-        // Cleanup
-        fs::remove_file(path).ok();
         Ok(())
     }
 
     #[test]
     fn test_read_meta_none_when_empty() -> Result<()> {
-        let path = tmp_path("meta_none");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("meta_none.sqlite3");
         let db = Db::open(&path)?;
         assert!(db.is_meta_empty()?);
 
         let meta = db.read_meta()?;
         assert!(meta.is_none());
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 
     #[test]
     fn test_write_and_read_meta_roundtrip() -> Result<()> {
-        let path = tmp_path("meta_roundtrip");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("meta_roundtrip.sqlite3");
         let db = Db::open(&path)?;
 
         let kdf = small_kdf();
@@ -834,13 +827,13 @@ mod tests {
         assert_eq!(wrapped3.ciphertext, wrapped_new.ciphertext);
         assert_eq!(verifier3, verifier_new);
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 
     #[test]
     fn test_insert_and_list_items_and_ordering() -> Result<()> {
-        let path = tmp_path("items_basic");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("items_basic.sqlite3");
         let db = Db::open(&path)?;
 
         let t_a = datetime!(2026-03-04 05:06:08 UTC);
@@ -864,13 +857,13 @@ mod tests {
         assert_eq!(rows[1].created_at, T0);
         assert_eq!(rows[1].updated_at, T0);
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 
     #[test]
     fn test_unique_name_constraint() -> Result<()> {
-        let path = tmp_path("unique_name");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("unique_name.sqlite3");
         let db = Db::open(&path)?;
 
         db.insert_item("unique", "password", b"n", b"c", T0)?;
@@ -878,13 +871,13 @@ mod tests {
 
         assert!(dup.is_err(), "duplicate item with same name should fail");
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 
     #[test]
     fn test_update_item_changes_ciphertext_and_updated_at() -> Result<()> {
-        let path = tmp_path("update_item");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("update_item.sqlite3");
         let db = Db::open(&path)?;
 
         let created = datetime!(2026-03-04 05:06:07 UTC);
@@ -906,13 +899,13 @@ mod tests {
         assert_eq!(after[0].updated_at, updated);
         assert_eq!(after[0].created_at, created);
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 
     #[test]
     fn test_delete_item_removes_row() -> Result<()> {
-        let path = tmp_path("delete_item");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("delete_item.sqlite3");
         let db = Db::open(&path)?;
 
         db.insert_item("to-del-1", "note", b"n", b"c", T0)?;
@@ -926,7 +919,6 @@ mod tests {
         assert_eq!(rows2.len(), 1);
         assert_ne!(rows2[0].id, id);
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 

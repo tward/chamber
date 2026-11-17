@@ -1036,12 +1036,6 @@ mod lib_module_tests {
     use std::fs;
     use std::str::FromStr;
 
-    fn tmp_db(name: &str) -> PathBuf {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
-        let pid = std::process::id();
-        std::env::temp_dir().join(format!("chamber_vault_lib_{name}_{pid}_{now}.sqlite3"))
-    }
-
     #[test]
     fn test_itemkind_as_str_and_from_str() {
         // Round-trip known variants
@@ -1097,7 +1091,8 @@ mod lib_module_tests {
 
     #[test]
     fn test_vault_initialize_and_is_initialized() -> Result<()> {
-        let path = tmp_db("init");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("init.sqlite3");
         let mut v = Vault::open_or_create(Some(&path))?;
         assert!(!v.is_initialized());
 
@@ -1108,13 +1103,13 @@ mod lib_module_tests {
         v.initialize("master-1")?;
         assert!(v.is_initialized());
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 
     #[test]
     fn test_vault_unlock_success_and_failure_paths() -> Result<()> {
-        let path = tmp_db("unlock");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("unlock.sqlite3");
         let mut v = Vault::open_or_create(Some(&path))?;
         v.initialize("secret")?;
 
@@ -1126,13 +1121,13 @@ mod lib_module_tests {
         let err = v2.unlock("wrong").unwrap_err().to_string();
         assert!(!err.is_empty());
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 
     #[test]
     fn test_vault_create_list_get_update_delete() -> Result<()> {
-        let path = tmp_db("crud");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("crud.sqlite3");
         let mut v = Vault::open_or_create(Some(&path))?;
         v.initialize("m")?;
         v.unlock("m")?;
@@ -1177,13 +1172,13 @@ mod lib_module_tests {
         assert_eq!(items_after.len(), 1);
         assert_eq!(items_after[0].name, "alpha");
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 
     #[test]
     fn test_vault_persistence_across_reopen() -> Result<()> {
-        let path = tmp_db("persist");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("persist.sqlite3");
         {
             let mut v = Vault::open_or_create(Some(&path))?;
             v.initialize("k")?;
@@ -1205,13 +1200,13 @@ mod lib_module_tests {
             assert_eq!(items[0].value, "first");
         }
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 
     #[test]
     fn test_change_master_key_preserves_items_and_allows_new_unlock() -> Result<()> {
-        let path = tmp_db("change_key");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("change_key.sqlite3");
 
         // Initialize, add items
         let mut v = Vault::open_or_create(Some(&path))?;
@@ -1237,13 +1232,13 @@ mod lib_module_tests {
         assert_eq!(items[0].name, "svc");
         assert_eq!(items[0].value, "token-123");
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 
     #[test]
     fn test_get_item_by_name_not_found() -> Result<()> {
-        let path = tmp_db("get_missing");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("get_missing.sqlite3");
         let mut v = Vault::open_or_create(Some(&path))?;
         v.initialize("m")?;
         v.unlock("m")?;
@@ -1255,7 +1250,6 @@ mod lib_module_tests {
 
         assert!(v.get_item_by_name("nope")?.is_none());
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 
@@ -1280,7 +1274,8 @@ mod lib_module_tests {
 
     #[test]
     fn test_lock_revokes_access_and_unlock_restores_items() -> Result<()> {
-        let path = tmp_db("lock_revokes");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("lock_revokes.sqlite3");
         let mut v = Vault::open_or_create(Some(&path))?;
         v.initialize("lock-master")?;
         v.unlock("lock-master")?;
@@ -1320,13 +1315,13 @@ mod lib_module_tests {
         assert_eq!(item.created_at, recorded.created_at);
         assert_eq!(item.updated_at, recorded.updated_at);
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 
     #[test]
     fn test_delete_item_on_locked_vault_fails_before_database() -> Result<()> {
-        let path = tmp_db("lock_delete_missing");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("lock_delete_missing.sqlite3");
         let mut v = Vault::open_or_create(Some(&path))?;
         v.initialize("lock-master")?;
         v.unlock("lock-master")?;
@@ -1336,13 +1331,13 @@ mod lib_module_tests {
         let err = v.delete_item(u64::MAX).unwrap_err();
         assert_eq!(err.to_string(), "Locked");
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 
     #[test]
     fn test_lock_on_never_unlocked_vault() -> Result<()> {
-        let path = tmp_db("lock_never_unlocked");
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("lock_never_unlocked.sqlite3");
         let mut v = Vault::open_or_create(Some(&path))?;
         v.initialize("lock-master")?;
         assert!(!v.is_unlocked());
@@ -1353,7 +1348,6 @@ mod lib_module_tests {
         v.unlock("lock-master")?;
         assert!(v.is_unlocked());
 
-        fs::remove_file(path).ok();
         Ok(())
     }
 
