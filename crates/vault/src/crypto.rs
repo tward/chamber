@@ -3,6 +3,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
+use hmac::digest::FixedOutput;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -353,10 +354,10 @@ pub const HKDF_SHA256_MAX_OUTPUT: usize = 255 * SHA256_LEN;
 /// An empty `salt` behaves as the RFC's default of 32 zero bytes: HMAC pads a key shorter than the
 /// hash block with zeros, so the two produce the same pseudorandom key.
 ///
-/// The pseudorandom key buffer and the expand step's block buffer are zeroized before returning.
-/// The temporaries returned by `finalize` (in the extract step and in every expand iteration) and
-/// the keyed HMAC states (the extract state keyed with `salt`, and each expand state keyed with the
-/// pseudorandom key) are dropped but not zeroized.
+/// Each HMAC output is written directly into the buffer that holds it: the extract output into
+/// the pseudorandom key buffer, and each expand output into the expand step's block buffer. Both
+/// buffers are zeroized before returning. The keyed HMAC states (the extract state keyed with
+/// `salt`, and each expand state keyed with the pseudorandom key) are dropped but not zeroized.
 ///
 /// # Errors
 /// Returns an error, leaving `okm` unchanged, when `okm` is longer than
@@ -373,7 +374,7 @@ pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], okm: &mut [u8]) -> Resu
     let mut extract = <HmacSha256 as Mac>::new_from_slice(salt)?;
     extract.update(ikm);
     let mut prk = [0u8; SHA256_LEN];
-    prk.copy_from_slice(&extract.finalize().into_bytes());
+    extract.finalize_into((&mut prk).into());
 
     let result = hkdf_sha256_expand(&prk, info, okm);
     prk.zeroize();
@@ -391,7 +392,7 @@ fn hkdf_sha256_expand(prk: &[u8; SHA256_LEN], info: &[u8], okm: &mut [u8]) -> Re
         mac.update(&block[..block_len]);
         mac.update(info);
         mac.update(&[counter]);
-        block.copy_from_slice(&mac.finalize().into_bytes());
+        mac.finalize_into((&mut block).into());
         block_len = SHA256_LEN;
         chunk.copy_from_slice(&block[..chunk.len()]);
     }
