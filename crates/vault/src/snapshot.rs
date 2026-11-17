@@ -80,7 +80,7 @@ pub const MAX_FILE_LEN: u64 = 64 * 1024 * 1024;
 pub const SNAPSHOT_KEY_INFO: &[u8] = b"chamber/snapshot/v1";
 
 /// The length of the item nonce every entry carries (the nonce of its stored ciphertext).
-const ITEM_NONCE_LEN: usize = 24;
+pub(crate) const ITEM_NONCE_LEN: usize = 24;
 
 // Header field offsets. Only the magic and the version are guaranteed for every version.
 const VERSION_OFFSET: usize = MAGIC.len();
@@ -548,7 +548,7 @@ pub enum PayloadField {
 
 impl PayloadField {
     /// How the field is named in a rejection message.
-    const fn description(self) -> &'static str {
+    pub(crate) const fn description(self) -> &'static str {
         match self {
             Self::EntryUuid => "an entry UUID",
             Self::Nonce => "an entry nonce",
@@ -561,7 +561,7 @@ impl PayloadField {
     }
 
     /// The form the field must take, as stated in a rejection message.
-    const fn requirement(self) -> &'static str {
+    pub(crate) const fn requirement(self) -> &'static str {
         match self {
             Self::EntryUuid | Self::DeviceId | Self::Tombstone => "a lowercase hyphenated UUID",
             Self::Nonce | Self::Ciphertext => "standard base64 with padding",

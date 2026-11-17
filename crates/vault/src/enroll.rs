@@ -31,9 +31,9 @@ use crate::db::{Db, new_random_uuid, read_sync_meta, wall_ms_to_sql, write_meta_
 use crate::merge::{SyncState, insert_entry, read_sync_state};
 use crate::revision::HighWaterMark;
 use crate::snapshot::{
-    EntryJson, FORMAT_VERSION, MAGIC, MAX_FILE_LEN, NONCE_LEN, PACKAGE_TYPE_ENROLLMENT, PACKAGE_TYPE_SNAPSHOT,
-    PayloadJson, SnapshotRejection, TAG_LEN, check_magic_and_version, check_size_bounds, open, read_bounded, seal,
-    validate_payload,
+    EntryJson, FORMAT_VERSION, ITEM_NONCE_LEN, MAGIC, MAX_FILE_LEN, NONCE_LEN, PACKAGE_TYPE_ENROLLMENT,
+    PACKAGE_TYPE_SNAPSHOT, PAYLOAD_SCHEMA, PayloadJson, SnapshotRejection, TAG_LEN, check_magic_and_version,
+    check_size_bounds, open, read_bounded, seal, validate_payload,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -737,8 +737,9 @@ pub enum EnrollmentError {
     },
     /// Decryption failed authentication: the transfer secret is wrong or the file is damaged.
     WrongSecretOrDamaged,
-    /// The decrypted payload breaks one of the snapshot payload rules, carried as the
-    /// [`SnapshotRejection`] for that rule.
+    /// The decrypted payload breaks one of the snapshot payload rules. The carried
+    /// [`SnapshotRejection`] identifies the rule; the message names that rule in enrollment terms
+    /// and never repeats the rejection's own snapshot wording or advice.
     Payload(SnapshotRejection),
     /// The payload's `vault_uuid` is not a lowercase hyphenated UUID.
     MalformedVaultUuid,
@@ -767,6 +768,52 @@ impl EnrollmentError {
 /// The advice for a package that decrypted correctly but carries content Chamber never writes.
 const AUTHENTIC_BUT_INVALID: &str = "The package was sealed with this transfer secret, so make sure both devices run the same version of \
      Chamber and write a new enrollment package.";
+
+/// The payload rule a [`SnapshotRejection`] stands for, described in enrollment terms.
+///
+/// The rejection's own `Display` speaks of a snapshot and advises publishing one again, which is
+/// wrong advice for a device joining a vault, so this never calls it. Like every enrollment
+/// message, the text names only the rule: no entry names, payload contents, or key material.
+struct PayloadRule<'a>(&'a SnapshotRejection);
+
+impl fmt::Display for PayloadRule<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            SnapshotRejection::InvalidPayload => write!(
+                f,
+                "its contents are not in the enrollment package format this version of Chamber reads (schema \
+                 {PAYLOAD_SCHEMA})."
+            ),
+            SnapshotRejection::MalformedField { field } => write!(
+                f,
+                "it contains {} that is not {}.",
+                field.description(),
+                field.requirement()
+            ),
+            SnapshotRejection::DuplicateEntry => f.write_str("it lists the same entry more than once."),
+            SnapshotRejection::EntryAndTombstone => f.write_str("it lists an entry as both present and deleted."),
+            SnapshotRejection::BadNonceLength { len } => write!(
+                f,
+                "it contains an entry whose nonce is {len} bytes instead of {ITEM_NONCE_LEN}."
+            ),
+            SnapshotRejection::EmptyName => f.write_str("it contains an entry with an empty name."),
+            SnapshotRejection::UnknownKind => {
+                f.write_str("it contains an entry of a kind this version of Chamber does not recognize.")
+            }
+            // Payload validation never returns these; they are header and file rules.
+            SnapshotRejection::Unreadable(_)
+            | SnapshotRejection::TooLarge { .. }
+            | SnapshotRejection::TooSmall { .. }
+            | SnapshotRejection::BadMagic
+            | SnapshotRejection::UnsupportedVersion { .. }
+            | SnapshotRejection::WrongPackageType { .. }
+            | SnapshotRejection::ForeignVault
+            | SnapshotRejection::AuthenticationFailed => {
+                f.write_str("its contents are not in a form this version of Chamber reads.")
+            }
+        }
+    }
+}
 
 impl fmt::Display for EnrollmentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -839,7 +886,8 @@ impl fmt::Display for EnrollmentError {
             Self::Payload(rejection) => write!(
                 f,
                 "The enrollment package decrypted, but the state it carries is not valid, so nothing was joined. \
-                 {AUTHENTIC_BUT_INVALID} The payload broke this rule: {rejection}"
+                 {AUTHENTIC_BUT_INVALID} The payload broke this rule: {}",
+                PayloadRule(rejection)
             ),
             Self::MalformedVaultUuid => write!(
                 f,
@@ -882,7 +930,9 @@ mod tests {
     use crate::clock::ManualClock;
     use crate::merge::SyncEntry;
     use crate::revision::Revision;
-    use crate::snapshot::{DecodedSnapshot, decode_snapshot, derive_snapshot_key, encode_snapshot, read_snapshot_file};
+    use crate::snapshot::{
+        DecodedSnapshot, PayloadField, decode_snapshot, derive_snapshot_key, encode_snapshot, read_snapshot_file,
+    };
     use crate::{Item, ItemKind, NewItem};
     use serde_json::{Value, json};
     use std::path::PathBuf;
@@ -1640,6 +1690,104 @@ mod tests {
             reject_json(&payload),
             EnrollmentError::Payload(SnapshotRejection::EntryAndTombstone)
         ));
+    }
+
+    /// Asserts that an enrollment message carries no snapshot wording or advice to publish.
+    fn assert_enrollment_wording(message: &str) {
+        let lower = message.to_lowercase();
+        assert!(!lower.contains("snapshot"), "{message}");
+        assert!(!lower.contains("publish"), "{message}");
+    }
+
+    #[test]
+    fn payload_errors_name_each_rule_in_enrollment_terms() {
+        let mut wrong_schema = valid_payload();
+        wrong_schema["schema"] = json!(2);
+
+        let mut malformed_field = valid_payload();
+        malformed_field["entries"][0]["uuid"] = json!(UUID_A.to_uppercase());
+
+        let mut duplicate_entry = valid_payload();
+        duplicate_entry["entries"] = json!([entry_json(UUID_A, SECRET_NAME), entry_json(UUID_A, "other")]);
+
+        let mut entry_and_tombstone = valid_payload();
+        entry_and_tombstone["tombstones"] = json!([UUID_A]);
+
+        let mut bad_nonce = valid_payload();
+        bad_nonce["entries"][0]["nonce"] = json!(BASE64.encode([5u8; 12]));
+
+        let mut empty_name = valid_payload();
+        empty_name["entries"][0]["name"] = json!("");
+
+        let mut unknown_kind = valid_payload();
+        unknown_kind["entries"][0]["kind"] = json!("not-a-kind");
+
+        let errors = [
+            reject_json(&wrong_schema),
+            reject_json(&malformed_field),
+            reject_json(&duplicate_entry),
+            reject_json(&entry_and_tombstone),
+            reject_json(&bad_nonce),
+            reject_json(&empty_name),
+            reject_json(&unknown_kind),
+        ];
+        let expected = [
+            matches!(errors[0], EnrollmentError::Payload(SnapshotRejection::InvalidPayload)),
+            matches!(
+                errors[1],
+                EnrollmentError::Payload(SnapshotRejection::MalformedField {
+                    field: PayloadField::EntryUuid
+                })
+            ),
+            matches!(errors[2], EnrollmentError::Payload(SnapshotRejection::DuplicateEntry)),
+            matches!(
+                errors[3],
+                EnrollmentError::Payload(SnapshotRejection::EntryAndTombstone)
+            ),
+            matches!(
+                errors[4],
+                EnrollmentError::Payload(SnapshotRejection::BadNonceLength { len: 12 })
+            ),
+            matches!(errors[5], EnrollmentError::Payload(SnapshotRejection::EmptyName)),
+            matches!(errors[6], EnrollmentError::Payload(SnapshotRejection::UnknownKind)),
+        ];
+        for (err, matched) in errors.iter().zip(expected) {
+            assert!(matched, "unexpected error: {err:?}");
+        }
+
+        let messages: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        for message in &messages {
+            assert_enrollment_wording(message);
+            assert!(message.contains("write a new enrollment package"), "{message}");
+        }
+        for (i, message) in messages.iter().enumerate() {
+            for other in &messages[i + 1..] {
+                assert_ne!(message, other);
+            }
+        }
+    }
+
+    #[test]
+    fn payload_error_carrying_a_header_rejection_has_enrollment_wording() {
+        let rejections = [
+            SnapshotRejection::Unreadable(io::Error::other("denied")),
+            SnapshotRejection::TooLarge { len: MAX_FILE_LEN + 1 },
+            SnapshotRejection::TooSmall { len: 3 },
+            SnapshotRejection::BadMagic,
+            SnapshotRejection::UnsupportedVersion { version: 9 },
+            SnapshotRejection::WrongPackageType { package_type: 9 },
+            SnapshotRejection::ForeignVault,
+            SnapshotRejection::AuthenticationFailed,
+        ];
+        let payload_rule = EnrollmentError::Payload(SnapshotRejection::InvalidPayload).to_string();
+        for rejection in rejections {
+            let rejection_text = rejection.to_string();
+            let message = EnrollmentError::Payload(rejection).to_string();
+            assert_enrollment_wording(&message);
+            assert!(!message.contains(&rejection_text), "{message}");
+            assert!(!message.contains("denied"), "no carried I/O text: {message}");
+            assert_ne!(message, payload_rule);
+        }
     }
 
     #[test]
