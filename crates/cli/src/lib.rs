@@ -1111,12 +1111,6 @@ mod handle_command_tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    fn tmp_path(name: &str) -> PathBuf {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
-        let pid = std::process::id();
-        std::env::temp_dir().join(format!("chamber_cli_{name}_{pid}_{now}"))
-    }
-
     #[tokio::test]
     async fn test_generate_simple_ok() {
         // Runs the simple generator branch (no prompts involved)
@@ -1217,7 +1211,8 @@ mod handle_command_tests {
     #[tokio::test]
     async fn test_import_missing_file_err() {
         // This hits the early error path for missing an input file without prompting.
-        let missing = tmp_path("missing").with_extension("json");
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("missing.json");
         let cmd = Commands::Import {
             input: missing,
             format: Some("json".to_string()),
