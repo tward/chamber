@@ -780,11 +780,11 @@ mod tests {
     fn sample_state() -> SyncState {
         SyncState {
             entries: vec![
-                entry(0x21, "github", "password"),
-                entry(0x22, "aws", "apikey"),
-                entry(0x23, "server notes", "securenote"),
+                entry(0xa1, "github", "password"),
+                entry(0xb2, "aws", "apikey"),
+                entry(0xc3, "server notes", "securenote"),
             ],
-            tombstones: vec![Uuid::from_bytes([0x31; 16]), Uuid::from_bytes([0x32; 16])],
+            tombstones: vec![Uuid::from_bytes([0xd1; 16]), Uuid::from_bytes([0xe2; 16])],
         }
     }
 
@@ -962,7 +962,7 @@ mod tests {
         );
         let source = &state.entries[0];
         let uuid = first["uuid"].as_str().unwrap();
-        assert_eq!(uuid, "21212121-2121-2121-2121-212121212121");
+        assert_eq!(uuid, "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1");
         assert_eq!(first["name"], json!("github"));
         assert_eq!(first["kind"], json!("password"));
         assert_eq!(first["nonce"].as_str().unwrap(), BASE64.encode(&source.nonce));
@@ -987,11 +987,16 @@ mod tests {
         assert_eq!(
             tombstones,
             &[
-                json!("31313131-3131-3131-3131-313131313131"),
-                json!("32323232-3232-3232-3232-323232323232")
+                json!("d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"),
+                json!("e2e2e2e2-e2e2-e2e2-e2e2-e2e2e2e2e2e2")
             ]
         );
         for text in std::iter::once(uuid).chain(tombstones.iter().map(|t| t.as_str().unwrap())) {
+            // Without a hex letter, the lowercase check below could not fail.
+            assert!(
+                text.contains(|c: char| matches!(c, 'a'..='f')),
+                "{text} has no hex letter"
+            );
             assert_eq!(text, text.to_lowercase());
             assert_eq!(text.matches('-').count(), 4);
         }
@@ -1006,7 +1011,7 @@ mod tests {
         assert_eq!(decoded.publisher_device_id, device_id());
         assert_eq!(decoded.snapshot_id, encoded.snapshot_id);
         assert_eq!(decoded.state.entries[0].created_at.nanosecond(), 123_456_789);
-        assert_eq!(decoded.state.entries[0].revision.wall_ms, u64::MAX - 0x21);
+        assert_eq!(decoded.state.entries[0].revision.wall_ms, u64::MAX - 0xa1);
     }
 
     #[test]

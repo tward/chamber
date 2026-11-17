@@ -768,27 +768,37 @@ mod tests {
         a.publish();
         b.publish();
 
-        // X receives each file once, both at the same time.
-        deliver(&a, &x);
-        deliver(&b, &x);
-        let report = x.merge();
-        assert_eq!(report.files.len(), 2);
-        assert!(!report.any_skipped());
+        // The report lists files in the order they were merged. With these fixed names, X merges
+        // A's state before B's and Y merges B's before A's, on every run. The publisher comes from
+        // the authenticated header, so the names decide only which files are read.
 
-        // Y receives B's file first, then A's file twice: under its own name and as a
-        // transport conflict copy. B's file is still there and is read a second time.
-        deliver(&b, &y);
-        y.merge();
-        let a_name = snapshot_file_name(a.device_id());
-        let b_name = snapshot_file_name(b.device_id());
-        let conflict = format!("{}.sync-conflict-20261117-090000-ABCDEFG.chsnap", a.device_id());
-        deliver(&a, &y);
-        deliver_as(&a, &y, &conflict);
+        // X receives each file once, both at the same time.
+        deliver_as(&a, &x, "1-from-a.chsnap");
+        deliver_as(&b, &x, "2-from-b.chsnap");
+        let report = x.merge();
+        assert!(!report.any_skipped());
+        let names: Vec<&str> = report.merged().map(|(name, _)| name).collect();
+        assert_eq!(names, ["1-from-a.chsnap", "2-from-b.chsnap"]);
+
+        // Y receives B's file first, then A's file twice: under a plain name and as a transport
+        // conflict copy. B's file is still there and is read a second time.
+        deliver_as(&b, &y, "1-from-b.chsnap");
         let report = y.merge();
         let names: Vec<&str> = report.merged().map(|(name, _)| name).collect();
-        let mut expected = vec![a_name.as_str(), b_name.as_str(), conflict.as_str()];
-        expected.sort_unstable();
-        assert_eq!(names, expected);
+        assert_eq!(names, ["1-from-b.chsnap"]);
+        let conflict = "2-from-a.sync-conflict-20261117-090000-ABCDEFG.chsnap";
+        deliver_as(&a, &y, "2-from-a.chsnap");
+        deliver_as(&a, &y, conflict);
+        let report = y.merge();
+        let names: Vec<&str> = report.merged().map(|(name, _)| name).collect();
+        assert_eq!(
+            names,
+            [
+                "1-from-b.chsnap",
+                "2-from-a.chsnap",
+                "2-from-a.sync-conflict-20261117-090000-ABCDEFG.chsnap",
+            ]
+        );
         let conflict_counts = report.merged().find(|(name, _)| *name == conflict).unwrap().1;
         assert_eq!(
             conflict_counts.added + conflict_counts.replaced + conflict_counts.removed,
@@ -1418,6 +1428,9 @@ mod tests {
         b.clock.advance(Duration::seconds(1));
         b.edit("github", "edited on b");
         b.add("poison", "refused");
+        // Every joined machine holds the base entries under the same UUIDs.
+        let aws = r.item("aws").uuid;
+        b.delete("aws");
         b.publish();
         deliver_as(&b, &r, "2-second.chsnap");
 
@@ -1433,12 +1446,19 @@ mod tests {
         assert_eq!(r.value("from-first").as_deref(), Some("first"));
         assert_eq!(r.value("poison"), None);
         assert_eq!(r.value("github").as_deref(), Some("gh-token-1"));
+        // Tombstones are applied before any entry, so the `aws` removal is always written before
+        // the refused insert. Whether `github`'s edit precedes it depends on random UUID order;
+        // this check does not, and fails on every run if the failed file is not rolled back.
+        assert_eq!(r.value("aws").as_deref(), Some("aws-key-1"));
+        assert!(!r.vault.tombstones().unwrap().contains(&aws));
 
         raw.execute_batch("DROP TRIGGER poison;").unwrap();
         let report = r.merge();
         assert!(!report.any_skipped());
         assert_eq!(r.value("poison").as_deref(), Some("refused"));
         assert_eq!(r.value("github").as_deref(), Some("edited on b"));
+        assert_eq!(r.value("aws"), None);
+        assert!(r.vault.tombstones().unwrap().contains(&aws));
     }
 
     // ---- Publication safety ----
@@ -1483,6 +1503,12 @@ mod tests {
 
     #[test]
     fn published_files_hold_no_names_or_values_in_the_clear() {
+        // Short needles such as the `BASE` names (`aws`, `wifi`) can occur in ciphertext by chance,
+        // so only long strings are searched for. A heuristic bound, assuming ciphertext bytes are
+        // uniformly random: a fixed 16-byte string matches at one offset with probability 2^-128,
+        // and a file under the 64 MiB size cap has at most 2^26 offsets, so the chance per file is
+        // at most 2^-102. The 16-byte figure is a heuristic margin, not a derived minimum.
+        const MIN_NEEDLE_LEN: usize = 16;
         let (_root, [mut a]) = network::<1>();
         let published = [("Pelican-Marmalade-8812", "correct-horse-battery-9931")];
         let interrupted = [("Narwhal-Teacup-5520", "zircon-lantern-7741")];
@@ -1496,11 +1522,23 @@ mod tests {
         a.vault.prepare_publication(&a.sync).unwrap();
         assert!(a.sync.join(temp_file_name(a.device_id())).exists());
 
+        let needles: Vec<(&str, &str)> = published.iter().chain(&interrupted).copied().collect();
+        for (name, value) in &needles {
+            assert!(
+                name.len() >= MIN_NEEDLE_LEN,
+                "the name {name} is too short to search for"
+            );
+            assert!(
+                value.len() >= MIN_NEEDLE_LEN,
+                "the value of {name} is too short to search for"
+            );
+        }
+
         let files = names_in(&a.sync);
         assert_eq!(files.len(), 2);
         for file in files {
             let bytes = fs::read(a.sync.join(&file)).unwrap();
-            for (name, value) in published.iter().chain(&interrupted).chain(&BASE) {
+            for (name, value) in &needles {
                 assert!(!contains(&bytes, name.as_bytes()), "{file} holds the name {name}");
                 assert!(!contains(&bytes, value.as_bytes()), "{file} holds the value of {name}");
             }
