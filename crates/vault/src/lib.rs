@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod db;
 mod manager;
 pub mod merge;
+pub mod names;
 mod registry;
 pub mod revision;
 
@@ -18,6 +19,7 @@ pub use crypto::{
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use db::{Db, ItemRow, SCHEMA_VERSION};
 pub use merge::{MergeCounts, SyncEntry, SyncState, content_digest};
+pub use names::{SHORT_UUID_LEN, display_name, shared_names, short_uuid};
 pub use revision::{HighWaterMark, Revision, RevisionSpaceExhausted, next_local_revision, unix_millis};
 pub use uuid::Uuid;
 
@@ -589,24 +591,38 @@ impl Vault {
         Ok(out)
     }
 
-    /// Retrieves an item by its name from the list of items.
+    /// Returns every item whose name equals `name` exactly (case-sensitive), in the order
+    /// [`Vault::list_items`] returns them.
     ///
-    /// This method searches for an item in the collection of items maintained by the instance.
-    /// It returns the first item that matches the provided name, if it exists.
-    ///
-    /// # Parameters
-    /// - `name`: The name of the item to search for, provided as a string slice (`&str`).
-    ///
-    /// # Returns
-    /// - `Ok(Some(Item))`: If an item with the given name is found.
-    /// - `Ok(None)`: If no item with the given name exists in the collection.
-    /// - `Err(Error)`: If an error occurs while retrieving the list of items.
+    /// Names are not unique: a merge can carry in entries from another device that share a
+    /// name with a local entry, because the entry UUID is the identity and merging never
+    /// renames. Callers that need a single item must decide among the matches themselves.
     ///
     /// # Errors
-    /// This function will return an error if the call to `self.list_items()` fails.
-    pub fn get_item_by_name(&self, name: &str) -> Result<Option<Item>> {
+    /// Returns an error if the call to [`Vault::list_items`] fails, for example on a locked
+    /// vault.
+    pub fn items_by_name(&self, name: &str) -> Result<Vec<Item>> {
         let items = self.list_items()?;
-        Ok(items.into_iter().find(|i| i.name == name))
+        Ok(items.into_iter().filter(|i| i.name == name).collect())
+    }
+
+    /// Retrieves the one item named exactly `name`, refusing to guess when several share it.
+    ///
+    /// # Returns
+    /// - `Ok(Some(Item))`: exactly one item has this name.
+    /// - `Ok(None)`: no item has this name.
+    ///
+    /// # Errors
+    /// Returns an error if the call to [`Vault::list_items`] fails, and also when more than one
+    /// item has this name (which a merge can produce). Use [`Vault::items_by_name`] to get every
+    /// match and choose among them.
+    pub fn get_item_by_name(&self, name: &str) -> Result<Option<Item>> {
+        let mut matches = self.items_by_name(name)?;
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.pop()),
+            n => Err(eyre!("Several items are named '{name}' ({n} matches)")),
+        }
     }
 
     /// Creates a new item and inserts it into the database.
@@ -1976,6 +1992,119 @@ mod lib_module_tests {
             assert_eq!(item.kind, ItemKind::Password);
             assert_eq!(item.value, "s3cret");
         }
+        Ok(())
+    }
+
+    // ---- Entries that share a name ----
+
+    /// Copies the entry named `name` under `uuid` through a merge, so the vault then holds two
+    /// decryptable entries with that name. Returns the UUID of the original.
+    fn duplicate_via_merge(v: &mut Vault, name: &str, uuid: Uuid) -> Result<Uuid> {
+        let exported = v.export_sync_state()?;
+        let original = exported
+            .entries
+            .into_iter()
+            .find(|e| e.name == name)
+            .expect("entry to copy exists");
+        let copy = SyncEntry {
+            uuid,
+            ..original.clone()
+        };
+        let counts = v.merge_sync_state(&SyncState {
+            entries: vec![copy],
+            tombstones: vec![],
+        })?;
+        assert_eq!(counts.added, 1);
+        Ok(original.uuid)
+    }
+
+    #[test]
+    fn test_items_by_name_returns_zero_one_and_two_exact_matches() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, _clock) = manual_vault(&dir, t0)?;
+        v.create_item(&new_note("shared"))?;
+        v.create_item(&new_note("unique"))?;
+
+        assert!(v.items_by_name("missing")?.is_empty());
+        assert!(v.items_by_name("Unique")?.is_empty(), "matching is case-sensitive");
+        assert!(v.items_by_name("uniq")?.is_empty(), "matching is exact, not by prefix");
+        let one = v.items_by_name("unique")?;
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name, "unique");
+
+        let copy = Uuid::from_bytes([0xC0; 16]);
+        let original = duplicate_via_merge(&mut v, "shared", copy)?;
+        let two = v.items_by_name("shared")?;
+        assert_eq!(two.len(), 2);
+        let mut uuids: Vec<Uuid> = two.iter().map(|i| i.uuid).collect();
+        uuids.sort_by_key(|u| *u.as_bytes());
+        let mut expected = vec![original, copy];
+        expected.sort_by_key(|u| *u.as_bytes());
+        assert_eq!(uuids, expected);
+        assert!(v.items_by_name("SHARED")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_item_by_name_none_single_and_error_on_two() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, _clock) = manual_vault(&dir, t0)?;
+        v.create_item(&new_note("shared"))?;
+        v.create_item(&new_note("unique"))?;
+
+        assert!(v.get_item_by_name("missing")?.is_none());
+        assert_eq!(v.get_item_by_name("unique")?.expect("one match").name, "unique");
+
+        duplicate_via_merge(&mut v, "shared", Uuid::from_bytes([0xC0; 16]))?;
+        let err = v.get_item_by_name("shared").unwrap_err().to_string();
+        assert!(err.contains("Several items"), "{err}");
+        assert!(err.contains("'shared'"), "{err}");
+        // Unrelated names still resolve.
+        assert_eq!(v.get_item_by_name("unique")?.expect("one match").name, "unique");
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_under_name_two_entries_share_is_still_refused() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, _clock) = manual_vault(&dir, t0)?;
+        v.create_item(&new_note("shared"))?;
+        duplicate_via_merge(&mut v, "shared", Uuid::from_bytes([0xC0; 16]))?;
+        let hwm = v.high_water_mark()?;
+
+        let err = v.create_item(&new_note("shared")).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(v.items_by_name("shared")?.len(), 2);
+        assert_eq!(v.high_water_mark()?, hwm);
+        Ok(())
+    }
+
+    #[test]
+    fn test_display_name_marks_only_shared_names_in_a_vault() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, _clock) = manual_vault(&dir, t0)?;
+        v.create_item(&new_note("shared"))?;
+        v.create_item(&new_note("unique"))?;
+        let copy = Uuid::from_bytes([0xC0; 16]);
+        let original = duplicate_via_merge(&mut v, "shared", copy)?;
+
+        let items = v.list_items()?;
+        let shared = shared_names(&items);
+        assert_eq!(shared.len(), 1);
+        assert!(shared.contains("shared"));
+        let mut shown: Vec<String> = items.iter().map(|i| display_name(i, &shared)).collect();
+        shown.sort();
+        let mut expected = vec![
+            format!("shared ({})", short_uuid(original)),
+            "shared (c0c0c0c0)".to_owned(),
+            "unique".to_owned(),
+        ];
+        expected.sort();
+        assert_eq!(shown, expected);
         Ok(())
     }
 }

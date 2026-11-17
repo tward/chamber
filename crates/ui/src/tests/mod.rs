@@ -3,6 +3,7 @@ mod lock_cleanup;
 mod lock_clipboard;
 mod lock_timer;
 mod refresh_items;
+mod shared_names;
 mod support;
 mod sync_recording;
 mod unlock;

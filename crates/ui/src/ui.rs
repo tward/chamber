@@ -3,7 +3,7 @@ use crate::app::{
     StatusType, UnlockField, ViewMode,
 };
 use crate::clock::ClockReading;
-use chamber_vault::ItemKind;
+use chamber_vault::{ItemKind, display_name, shared_names};
 use color_eyre::Result;
 use ratatui::crossterm::event;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -957,6 +957,11 @@ fn draw_items_section(f: &mut Frame, app: &App, area: Rect) {
     let mut list_items: Vec<ListItem> = Vec::new();
     let mut current_category = None;
 
+    // Names that several entries share get a short UUID suffix. Work them out from every entry
+    // of the vault, not the filtered view, so an entry keeps its suffix when the search hides
+    // its namesake.
+    let shared = shared_names(&app.items);
+
     for (index, item) in app.filtered_items.iter().enumerate() {
         // Skip items outside visible range
         if index < visible_start || index >= visible_end {
@@ -1044,7 +1049,7 @@ fn draw_items_section(f: &mut Frame, app: &App, area: Rect) {
         let truncated_name = if max_name_width < 1 {
             "…".to_string() // Show ellipsis if no room
         } else {
-            truncate_text(&item.name, max_name_width.max(1))
+            truncate_text(&display_name(item, &shared), max_name_width.max(1))
         };
 
         // Highlight search matches in the item name

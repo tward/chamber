@@ -1,6 +1,7 @@
 mod api;
 mod backup;
 mod health;
+mod resolve;
 mod stats;
 #[cfg(test)]
 mod test_support;
@@ -10,6 +11,7 @@ mod vault;
 use crate::api::handle_api_command;
 use crate::backup::{BackupCommand, handle_backup_command};
 use crate::health::{analyze_password_strength, handle_health_command};
+use crate::resolve::lookup_item_on_terminal;
 use crate::stats::handle_stats_command;
 use crate::utils::{filter_and_sort_items, format_relative_time};
 use crate::vault::{VaultCommand, handle_vault_command};
@@ -17,10 +19,11 @@ use chamber_import_export::{ExportFormat, detect_format_from_extension, export_i
 use chamber_password_gen::{
     PasswordConfig, generate_complex_password, generate_memorable_password, generate_simple_password,
 };
-use chamber_vault::{Item, ItemKind, NewItem, Vault, VaultManager};
+use chamber_vault::{Item, ItemKind, NewItem, Vault, VaultManager, display_name, shared_names};
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
+use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use time::OffsetDateTime;
@@ -424,42 +427,23 @@ pub async fn handle_command(cmd: Commands) -> Result<()> {
             vault.unlock(&master)?;
 
             let all_items = vault.list_items()?;
-            let filtered_items =
-                match filter_and_sort_items(all_items, r#type.as_deref(), since.as_deref(), recent, name.as_deref()) {
-                    Ok(items) => items,
-                    Err(e) => {
-                        return Err(eyre!("Error while filtering items: {e}"));
-                    }
-                };
-
-            if filtered_items.is_empty() {
-                println!("No items found matching the criteria.");
-                return Ok(());
-            }
-
-            // Display results with enhanced formatting
-            println!("Found {} item(s):", filtered_items.len());
-            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-            for item in filtered_items {
-                let age = format_relative_time(item.created_at);
-                println!(
-                    "• {} [{}] - created {} ({})",
-                    item.name,
-                    item.kind.display_name(),
-                    age,
-                    item.created_at
-                        .format(&time::format_description::well_known::Rfc3339)
-                        .unwrap_or_else(|_| "unknown".to_string())
-                );
-            }
+            write_item_list(
+                all_items,
+                &ListFilter {
+                    kind: r#type.as_deref(),
+                    since: since.as_deref(),
+                    recent,
+                    name: name.as_deref(),
+                },
+                &mut std::io::stdout().lock(),
+            )?;
         }
 
         Commands::Get { name, copy_value } => {
             let mut vault = Vault::open_or_create(None)?;
             let master = prompt_secret("Enter master key: ")?;
             vault.unlock(&master)?;
-            if let Some(item) = vault.get_item_by_name(&name)? {
+            if let Some(item) = lookup_item_on_terminal(&vault, &name)? {
                 if copy_value {
                     // Copy to clipboard instead of displaying
                     let mut clipboard =
@@ -857,6 +841,58 @@ fn is_weak_password(password: &str) -> bool {
     !(has_lower && has_upper && has_digit && has_special)
 }
 
+/// The filters `chamber list` applies, as given on the command line.
+#[derive(Debug, Default, Clone, Copy)]
+struct ListFilter<'a> {
+    kind: Option<&'a str>,
+    since: Option<&'a str>,
+    recent: Option<usize>,
+    name: Option<&'a str>,
+}
+
+/// Writes the `chamber list` output for `all_items`, every entry of the vault, to `out`.
+///
+/// Each entry is shown by its display name: `name (1a2b3c4d)` when another entry of the vault
+/// has the same name, and the bare name otherwise. The shared names are worked out from
+/// `all_items` before filtering, so an entry keeps its suffix even when the filter hides its
+/// namesake.
+///
+/// # Errors
+/// Returns an error when a filter is invalid or writing to `out` fails.
+fn write_item_list<W: Write>(all_items: Vec<Item>, filter: &ListFilter<'_>, out: &mut W) -> Result<()> {
+    let shared = shared_names(&all_items);
+    let filtered_items = match filter_and_sort_items(all_items, filter.kind, filter.since, filter.recent, filter.name) {
+        Ok(items) => items,
+        Err(e) => {
+            return Err(eyre!("Error while filtering items: {e}"));
+        }
+    };
+
+    if filtered_items.is_empty() {
+        writeln!(out, "No items found matching the criteria.")?;
+        return Ok(());
+    }
+
+    // Display results with enhanced formatting
+    writeln!(out, "Found {} item(s):", filtered_items.len())?;
+    writeln!(out, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")?;
+
+    for item in filtered_items {
+        let age = format_relative_time(item.created_at);
+        writeln!(
+            out,
+            "• {} [{}] - created {} ({})",
+            display_name(&item, &shared),
+            item.kind.display_name(),
+            age,
+            item.created_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string())
+        )?;
+    }
+    Ok(())
+}
+
 const fn get_type_emoji(item_type: ItemKind) -> &'static str {
     match item_type {
         ItemKind::Password => "🔑",
@@ -889,6 +925,10 @@ fn prompt_secret(prompt: &str) -> Result<String> {
 
 /// Searches for an item by name across all available vaults
 /// Returns (vault, item, `vault_name`) if found, or (_, None, _) if not found
+///
+/// The first vault holding at least one entry with this name is used. When several of its
+/// entries share the name, [`lookup_item_on_terminal`] asks which one is meant; an aborted or
+/// failed choice is returned as an error and no other vault is searched.
 fn find_item_across_vaults(item_name: &str) -> Result<(Vault, Option<Item>, String)> {
     let manager = VaultManager::new()?;
     let vaults = manager.list_vaults();
@@ -902,7 +942,9 @@ fn find_item_across_vaults(item_name: &str) -> Result<(Vault, Option<Item>, Stri
             ))?;
 
             if vault.unlock(&master).is_ok() {
-                if let Ok(Some(item)) = vault.get_item_by_name(item_name) {
+                // The first vault with a match is the one used: an aborted or failed choice
+                // ends the command instead of moving on to other vaults.
+                if let Some(item) = lookup_item_on_terminal(&vault, item_name)? {
                     let vault_name = get_vault_display_name(&manager, &vault_id);
                     return Ok((vault, Some(item), vault_name));
                 }
@@ -931,7 +973,7 @@ fn find_item_across_vaults(item_name: &str) -> Result<(Vault, Option<Item>, Stri
             Ok(mut vault) => match vault.unlock(&master) {
                 Ok(()) => {
                     tried_vaults.push(vault_info.name.clone());
-                    if let Ok(Some(item)) = vault.get_item_by_name(item_name) {
+                    if let Some(item) = lookup_item_on_terminal(&vault, item_name)? {
                         return Ok((vault, Some(item), vault_info.name.clone()));
                     }
                 }
@@ -1033,7 +1075,7 @@ fn find_item_in_specific_vault(item_name: &str, vault_identifier: &str) -> Resul
     let master = prompt_secret(&format!("Enter master key for '{}': ", vault_info.name))?;
     vault.unlock(&master)?;
 
-    let item = vault.get_item_by_name(item_name)?;
+    let item = lookup_item_on_terminal(&vault, item_name)?;
     Ok((vault, item, vault_info.name.clone()))
 }
 
@@ -1261,5 +1303,127 @@ mod handle_command_tests {
             assert_eq!(kept.value, "qq-present-value", "the skipped entry keeps its value");
             assert_eq!(tv.vault.list_items().unwrap().len(), 4);
         }
+    }
+
+    // ---- List output with entries that share a name ----
+
+    fn list_output(items: Vec<Item>, filter: &ListFilter<'_>) -> String {
+        let mut out = Vec::new();
+        write_item_list(items, filter, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn item_lines(output: &str) -> Vec<&str> {
+        output.lines().filter(|l| l.starts_with("• ")).collect()
+    }
+
+    fn list_items_sharing_a_name() -> Vec<Item> {
+        use crate::test_support::synthetic_item;
+        use chamber_vault::Uuid;
+        let t = time::macros::datetime!(2026-03-01 10:00:00 UTC);
+        vec![
+            synthetic_item(
+                "zz-github",
+                ItemKind::Password,
+                Uuid::parse_str("1a2b3c4d-0000-4000-8000-000000000001").unwrap(),
+                t,
+            ),
+            synthetic_item(
+                "zz-github",
+                ItemKind::Note,
+                Uuid::parse_str("9f8e7d6c-0000-4000-8000-000000000002").unwrap(),
+                t + time::Duration::hours(1),
+            ),
+            synthetic_item(
+                "zz-gitlab",
+                ItemKind::Password,
+                Uuid::parse_str("55555555-0000-4000-8000-000000000003").unwrap(),
+                t + time::Duration::hours(2),
+            ),
+        ]
+    }
+
+    #[test]
+    fn list_marks_shared_names_with_suffixes_and_prints_unique_names_bare() {
+        let output = list_output(list_items_sharing_a_name(), &ListFilter::default());
+        let lines = item_lines(&output);
+        assert_eq!(lines.len(), 3, "{output}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("• zz-github (1a2b3c4d) [Password] - created ")),
+            "{output}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("• zz-github (9f8e7d6c) [Note] - created ")),
+            "{output}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("• zz-gitlab [Password] - created ")),
+            "{output}"
+        );
+        assert!(!output.contains("55555555"), "a unique name has no suffix: {output}");
+        assert!(output.starts_with("Found 3 item(s):"), "{output}");
+        assert!(!output.contains("qq-secret-of"), "no value is printed: {output}");
+    }
+
+    #[test]
+    fn list_keeps_the_suffix_when_the_filter_hides_the_namesake() {
+        let output = list_output(
+            list_items_sharing_a_name(),
+            &ListFilter {
+                kind: Some("note"),
+                ..ListFilter::default()
+            },
+        );
+        assert_eq!(item_lines(&output).len(), 1, "the filter hides the namesake: {output}");
+        assert!(
+            item_lines(&output)[0].starts_with("• zz-github (9f8e7d6c) [Note] - created "),
+            "{output}"
+        );
+
+        let output = list_output(
+            list_items_sharing_a_name(),
+            &ListFilter {
+                recent: Some(2),
+                ..ListFilter::default()
+            },
+        );
+        let lines = item_lines(&output);
+        assert_eq!(lines.len(), 2, "{output}");
+        assert!(lines[0].starts_with("• zz-gitlab [Password]"), "{output}");
+        assert!(lines[1].starts_with("• zz-github (9f8e7d6c) [Note]"), "{output}");
+    }
+
+    #[test]
+    fn list_of_vault_entries_sharing_a_name_shows_both_suffixes() {
+        use crate::test_support::duplicate_via_merge;
+        use chamber_vault::{Uuid, short_uuid};
+        let mut tv = unlocked_vault();
+        tv.vault.create_item(&new_item("zz-cli-shared", "qq-original")).unwrap();
+        tv.vault.create_item(&new_item("zz-cli-unique", "qq-unique")).unwrap();
+        let original = listed(&tv.vault, "zz-cli-shared");
+        duplicate_via_merge(
+            &mut tv.vault,
+            "zz-cli-shared",
+            Uuid::parse_str("c0c0c0c0-0000-4000-8000-000000000000").unwrap(),
+            time::Duration::hours(1),
+        );
+
+        let output = list_output(tv.vault.list_items().unwrap(), &ListFilter::default());
+        let lines = item_lines(&output);
+        assert_eq!(lines.len(), 3, "{output}");
+        assert!(
+            lines.iter().any(|l| l.starts_with("• zz-cli-shared (c0c0c0c0) [Note]")),
+            "{output}"
+        );
+        let original_line = format!("• zz-cli-shared ({}) [Note]", short_uuid(original.uuid));
+        assert!(lines.iter().any(|l| l.starts_with(&original_line)), "{output}");
+        assert!(
+            lines.iter().any(|l| l.starts_with("• zz-cli-unique [Note]")),
+            "{output}"
+        );
     }
 }

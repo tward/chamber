@@ -3,8 +3,9 @@
 //!
 //! Nothing here opens the default vault or the vault registry, touches the clipboard, or prompts.
 
-use chamber_vault::{Item, ItemKind, NewItem, Vault};
+use chamber_vault::{Item, ItemKind, NewItem, Revision, SyncEntry, SyncState, Uuid, Vault};
 use tempfile::TempDir;
+use time::OffsetDateTime;
 
 /// Synthetic master password for test vaults.
 pub const MASTER_PASSWORD: &str = "Synthetic-Cli-Master-42";
@@ -85,7 +86,16 @@ pub fn assert_recorded_creates(vault: &Vault, names: &[&str], hwm_before: (u64, 
 /// strictly greater revision from this vault's device, equal to the high-water mark. Returns the
 /// item as listed now.
 pub fn assert_recorded_edit(vault: &Vault, before: &Item) -> Item {
-    let after = listed(vault, &before.name);
+    assert_edit(vault, before, listed(vault, &before.name))
+}
+
+/// [`assert_recorded_edit`] for an entry that may share its name with others: the entry is
+/// found by its UUID instead of its name.
+pub fn assert_recorded_edit_of(vault: &Vault, before: &Item) -> Item {
+    assert_edit(vault, before, listed_by_uuid(vault, before.uuid))
+}
+
+fn assert_edit(vault: &Vault, before: &Item, after: Item) -> Item {
     assert_eq!(after.uuid, before.uuid, "an edit keeps the entry UUID");
     assert!(after.revision > before.revision, "an edit assigns a greater revision");
     assert_eq!(
@@ -119,4 +129,54 @@ fn assert_created_entry(vault: &Vault, name: &str) -> Item {
         "the revision of '{name}' names this device"
     );
     item
+}
+
+/// Copies the entry named `name` under `uuid` through a merge, as another device's carried
+/// entry would arrive, with its updated time moved `newer_by` later. The vault then holds two
+/// decryptable entries with that name. Returns the copy as listed.
+pub fn duplicate_via_merge(vault: &mut Vault, name: &str, uuid: Uuid, newer_by: time::Duration) -> Item {
+    let original = vault
+        .export_sync_state()
+        .expect("export sync state")
+        .entries
+        .into_iter()
+        .find(|e| e.name == name)
+        .expect("the entry to copy exists");
+    let copy = SyncEntry {
+        uuid,
+        updated_at: original.updated_at + newer_by,
+        ..original
+    };
+    let counts = vault
+        .merge_sync_state(&SyncState {
+            entries: vec![copy],
+            tombstones: vec![],
+        })
+        .expect("merge the copy");
+    assert_eq!(counts.added, 1, "the copy is added");
+    listed_by_uuid(vault, uuid)
+}
+
+/// The listed item with entry UUID `uuid`.
+pub fn listed_by_uuid(vault: &Vault, uuid: Uuid) -> Item {
+    vault
+        .list_items()
+        .expect("list items")
+        .into_iter()
+        .find(|i| i.uuid == uuid)
+        .expect("the item is listed")
+}
+
+/// A synthetic in-memory item, not stored in any vault.
+pub fn synthetic_item(name: &str, kind: ItemKind, uuid: Uuid, updated_at: OffsetDateTime) -> Item {
+    Item {
+        id: 0,
+        name: name.to_string(),
+        kind,
+        value: format!("qq-secret-of-{uuid}"),
+        created_at: updated_at,
+        updated_at,
+        uuid,
+        revision: Revision::default(),
+    }
 }
