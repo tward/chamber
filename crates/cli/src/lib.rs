@@ -26,7 +26,7 @@ use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use time::OffsetDateTime;
 
@@ -328,9 +328,16 @@ pub enum Commands {
 ///     count: Some(3),
 /// });
 /// ```
+pub async fn handle_command(cmd: Commands) -> Result<()> {
+    dispatch_command(cmd, None).await
+}
+
+/// The body of [`handle_command`], with the vault file that `Commands::Backup` opens made
+/// explicit so a test can run that arm against a vault in a temp directory. `None` means the
+/// default vault. No other command reads `backup_vault_path`.
 #[allow(clippy::cognitive_complexity)]
 #[allow(clippy::too_many_lines)]
-pub async fn handle_command(cmd: Commands) -> Result<()> {
+async fn dispatch_command(cmd: Commands, backup_vault_path: Option<&Path>) -> Result<()> {
     match cmd {
         Commands::Api { bind, port } => handle_api_command(bind, port).await?,
 
@@ -708,7 +715,7 @@ pub async fn handle_command(cmd: Commands) -> Result<()> {
         }
 
         Commands::Backup(backup_cmd) => {
-            let vault = Vault::open_or_create(None)?;
+            let vault = Vault::open_or_create(backup_vault_path)?;
             handle_backup_command(vault, backup_cmd)?;
         }
         Commands::Registry(registry_cmd) => {
@@ -1223,22 +1230,20 @@ mod handle_command_tests {
         assert!(err.contains("Input file does not exist"));
     }
 
-    // The tests below drive the write steps behind the Add, Update, and Import commands on an
-    // unlocked temp-directory vault, and check the synchronization state each write records.
-
-    #[test]
-    fn backup_dispatch_returns_restore_of_missing_file_error() {
+    #[tokio::test]
+    async fn backup_dispatch_returns_restore_of_missing_file_error() {
         let dir = tempfile::TempDir::new().unwrap();
-        let vault = Vault::open_or_create(Some(&dir.path().join("vault.db"))).unwrap();
+        let vault_path = dir.path().join("vault.db");
         let missing = dir.path().join("missing-backup.json");
 
-        let res = handle_backup_command(
-            vault,
-            BackupCommand::Restore {
+        let res = dispatch_command(
+            Commands::Backup(BackupCommand::Restore {
                 backup_path: missing,
                 yes: true,
-            },
-        );
+            }),
+            Some(&vault_path),
+        )
+        .await;
 
         let err = res.unwrap_err().to_string();
         assert!(err.contains("Backup file not found"), "unexpected error: {err}");
@@ -1250,6 +1255,9 @@ mod handle_command_tests {
         write_prompt(&mut sink, "Enter master key: ").unwrap();
         assert_eq!(sink, b"Enter master key: ");
     }
+
+    // The tests below drive the write steps behind the Add, Update, and Import commands on an
+    // unlocked temp-directory vault, and check the synchronization state each write records.
 
     use crate::test_support::{
         assert_recorded_create, assert_recorded_creates, assert_recorded_edit, listed, new_item, unlocked_vault,
