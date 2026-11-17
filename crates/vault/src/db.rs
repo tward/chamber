@@ -218,14 +218,7 @@ impl Db {
     /// * The `id` is fixed as `1` to allow for a single metadata record, effectively overriding any
     ///   existing metadata in the `meta` table.
     pub fn write_meta(&self, kdf: &KdfParams, wrapped: &WrappedVaultKey, verifier: &[u8]) -> Result<()> {
-        let kdf_json = serde_json::to_string(kdf)?;
-        let wrapped_json = serde_json::to_vec(wrapped)?;
-        self.conn.execute("DELETE FROM meta", [])?;
-        self.conn.execute(
-            "INSERT INTO meta (id, kdf_params, wrapped_key, verifier) VALUES (1, ?, ?, ?)",
-            params![kdf_json, wrapped_json, verifier],
-        )?;
-        Ok(())
+        write_meta_row(&self.conn, kdf, wrapped, verifier)
     }
 
     /// Reads metadata from the database.
@@ -657,9 +650,30 @@ pub(crate) fn write_high_water_mark(conn: &Connection, hwm: HighWaterMark) -> Re
     Ok(())
 }
 
+/// Replaces the `meta` row with `kdf`, `wrapped`, and `verifier`, on `conn` as given: inside
+/// the caller's transaction when there is one. See [`Db::write_meta`].
+///
+/// # Errors
+/// Returns an error if serialization or either SQL statement fails.
+pub(crate) fn write_meta_row(
+    conn: &Connection,
+    kdf: &KdfParams,
+    wrapped: &WrappedVaultKey,
+    verifier: &[u8],
+) -> Result<()> {
+    let kdf_json = serde_json::to_string(kdf)?;
+    let wrapped_json = serde_json::to_vec(wrapped)?;
+    conn.execute("DELETE FROM meta", [])?;
+    conn.execute(
+        "INSERT INTO meta (id, kdf_params, wrapped_key, verifier) VALUES (1, ?, ?, ?)",
+        params![kdf_json, wrapped_json, verifier],
+    )?;
+    Ok(())
+}
+
 /// Mints 16 random bytes as a UUID. All 128 bits are random: unlike `Uuid::new_v4`, no
 /// version or variant bits are overwritten.
-fn new_random_uuid() -> Result<Uuid> {
+pub(crate) fn new_random_uuid() -> Result<Uuid> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| eyre!("Failed to get random bytes: {e}"))?;
     Ok(Uuid::from_bytes(bytes))

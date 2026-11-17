@@ -230,22 +230,53 @@ fn merge_entry(conn: &Connection, incoming: &SyncEntry) -> Result<EntryOutcome> 
         Some(_) => return Ok(EntryOutcome::Unchanged),
     };
 
+    write_entry(conn, sql, incoming)?;
+    Ok(outcome)
+}
+
+/// Runs `sql` ([`INSERT_ENTRY`] or [`REPLACE_ENTRY`]) with every carried field of `entry`.
+fn write_entry(conn: &Connection, sql: &str, entry: &SyncEntry) -> Result<()> {
     conn.execute(
         sql,
         params![
-            uuid,
-            incoming.name,
-            incoming.kind,
-            incoming.nonce,
-            incoming.ciphertext,
-            stamp(incoming.created_at)?,
-            stamp(incoming.updated_at)?,
-            wall_ms_to_sql(incoming.revision.wall_ms),
-            incoming.revision.counter,
-            incoming.revision.device_id.as_bytes(),
+            entry.uuid.as_bytes(),
+            entry.name,
+            entry.kind,
+            entry.nonce,
+            entry.ciphertext,
+            stamp(entry.created_at)?,
+            stamp(entry.updated_at)?,
+            wall_ms_to_sql(entry.revision.wall_ms),
+            entry.revision.counter,
+            entry.revision.device_id.as_bytes(),
         ],
     )?;
-    Ok(outcome)
+    Ok(())
+}
+
+/// Inserts `entry` as a new row exactly as carried (UUID, name, kind, nonce, ciphertext, both
+/// timestamps as RFC 3339 in UTC, and revision). Nothing is checked first: a row with the same
+/// UUID makes the insert fail on the unique index.
+///
+/// # Errors
+/// Returns an error if a timestamp cannot be formatted or the insert fails.
+pub(crate) fn insert_entry(conn: &Connection, entry: &SyncEntry) -> Result<()> {
+    write_entry(conn, INSERT_ENTRY, entry)
+}
+
+/// Reads every entry exactly as stored, ascending by UUID bytes, and every tombstone, ascending
+/// by bytes. The caller provides the transaction that makes the two reads consistent.
+///
+/// # Errors
+/// Returns an error if the database cannot be read or a stored row is malformed.
+pub(crate) fn read_sync_state(conn: &Connection) -> Result<SyncState> {
+    let entries = {
+        let mut stmt = conn.prepare(&format!("SELECT {ENTRY_COLUMNS} FROM items ORDER BY uuid ASC"))?;
+        stmt.query_map([], entry_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let tombstones = read_tombstones(conn)?;
+    Ok(SyncState { entries, tombstones })
 }
 
 /// Raises the stored high-water mark to the greatest `(wall_ms, counter)` among its current
@@ -277,14 +308,9 @@ impl Db {
     /// 16-byte blob, or a `rev_counter` that does not fit in a `u32`).
     pub fn export_sync_state(&self) -> Result<SyncState> {
         let tx = self.read_transaction()?;
-        let entries = {
-            let mut stmt = tx.prepare(&format!("SELECT {ENTRY_COLUMNS} FROM items ORDER BY uuid ASC"))?;
-            stmt.query_map([], entry_from_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let tombstones = read_tombstones(&tx)?;
+        let state = read_sync_state(&tx)?;
         tx.commit()?;
-        Ok(SyncState { entries, tombstones })
+        Ok(state)
     }
 
     /// Merges another copy's synchronization state into this database.

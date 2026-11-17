@@ -4,6 +4,7 @@ pub mod clock;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod enroll;
 mod manager;
 pub mod merge;
 pub mod names;

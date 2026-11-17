@@ -223,7 +223,7 @@ pub fn read_snapshot_file(
 /// Reads `reader` to its end, but never more than [`MAX_FILE_LEN`] plus one byte, which is enough
 /// for the size check that follows to see that the input is too large. `expected_len` is the size
 /// the caller already checked, used only to size the buffer.
-fn read_bounded(reader: impl Read, expected_len: u64) -> io::Result<Vec<u8>> {
+pub(crate) fn read_bounded(reader: impl Read, expected_len: u64) -> io::Result<Vec<u8>> {
     let capacity = usize::try_from(expected_len.min(MAX_FILE_LEN)).unwrap_or(0);
     let mut bytes = Vec::with_capacity(capacity);
     reader.take(MAX_FILE_LEN + 1).read_to_end(&mut bytes)?;
@@ -345,10 +345,10 @@ pub(crate) fn open(
 /// The JSON payload of a snapshot.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PayloadJson {
-    schema: u64,
-    entries: Vec<EntryJson>,
-    tombstones: Vec<String>,
+pub(crate) struct PayloadJson {
+    pub(crate) schema: u64,
+    pub(crate) entries: Vec<EntryJson>,
+    pub(crate) tombstones: Vec<String>,
 }
 
 /// One entry in a payload. Identifier, binary, and timestamp fields are plain strings here and are
@@ -377,7 +377,11 @@ pub(crate) struct RevisionJson {
 }
 
 impl PayloadJson {
-    fn from_state(state: &SyncState) -> Result<Self> {
+    /// Converts `state` to its payload form with the current [`PAYLOAD_SCHEMA`].
+    ///
+    /// # Errors
+    /// Returns an error when an entry timestamp cannot be written as RFC 3339.
+    pub(crate) fn from_state(state: &SyncState) -> Result<Self> {
         let entries = state.entries.iter().map(EntryJson::from_entry).collect::<Result<_>>()?;
         Ok(Self {
             schema: PAYLOAD_SCHEMA,
