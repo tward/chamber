@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod db;
 mod manager;
 mod registry;
+pub mod revision;
 
 // Re-export commonly used types and functions for easier access
 pub use crypto::{
@@ -14,7 +15,9 @@ pub use crypto::{
 };
 
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use db::{Db, ItemRow};
+pub use db::{Db, ItemRow, SCHEMA_VERSION};
+pub use revision::{HighWaterMark, Revision, RevisionSpaceExhausted, next_local_revision, unix_millis};
+pub use uuid::Uuid;
 
 pub use crate::autolock::AutoLockConfig;
 pub use crate::autolock_service::AutoLockCallback;
@@ -462,6 +465,35 @@ impl Vault {
         Ok(())
     }
 
+    /// Returns this vault's UUID, which identifies the vault across devices.
+    ///
+    /// It is minted when the database is created or migrated to schema version 1, needs no
+    /// key, and works on a locked vault.
+    ///
+    /// # Errors
+    /// Returns an error if the database cannot be read.
+    pub fn vault_uuid(&self) -> Result<Uuid> {
+        self.db.vault_uuid()
+    }
+
+    /// Returns this device's ID, which every local revision carries. Works on a locked vault.
+    ///
+    /// # Errors
+    /// Returns an error if the database cannot be read.
+    pub fn device_id(&self) -> Result<Uuid> {
+        self.db.device_id()
+    }
+
+    /// Returns the high-water mark as `(wall_ms, counter)`: the greatest pair this vault has
+    /// seen in any revision. Works on a locked vault.
+    ///
+    /// # Errors
+    /// Returns an error if the database cannot be read.
+    pub fn high_water_mark(&self) -> Result<(u64, u32)> {
+        let hwm = self.db.high_water_mark()?;
+        Ok((hwm.wall_ms, hwm.counter))
+    }
+
     pub const fn is_unlocked(&self) -> bool {
         self.key.is_some()
     }
@@ -579,8 +611,10 @@ impl Vault {
     /// - If encryption fails for any reason.
     /// - If the database insertion fails.
     ///
-    /// # Timestamps
-    /// `created_at` and `updated_at` are both set to one reading of the vault's clock.
+    /// # Timestamps and revision
+    /// `created_at` and `updated_at` are both set to one reading of the vault's clock. The same
+    /// reading feeds the item's first revision, which [`Db::insert_item`] assigns from the
+    /// stored high-water mark along with a new entry UUID.
     pub fn create_item(&mut self, item: &NewItem) -> Result<()> {
         let vk = self.key.as_ref().ok_or_else(|| eyre!("Locked"))?;
         let nonce_cipher = aead_encrypt(
@@ -707,8 +741,11 @@ impl Vault {
     /// - If the item is not found, an `eyre!("Item not found")` error is returned.
     /// - Any failures during encryption or database operations propagate as errors.
     ///
-    /// # Timestamps
-    /// `updated_at` is set to one reading of the vault's clock; `created_at` is unchanged.
+    /// # Timestamps and revision
+    /// `updated_at` is set to one reading of the vault's clock; `created_at` is unchanged. The
+    /// same reading feeds the item's new revision, which [`Db::update_item`] assigns from the
+    /// stored high-water mark. The revision is greater than every earlier one even when the
+    /// clock has moved backward, while `updated_at` stores the clock reading as is.
     pub fn update_item(&mut self, id: u64, new_value: &str) -> Result<()> {
         let vk = self.key.as_ref().ok_or_else(|| eyre!("Locked"))?;
 
@@ -1461,6 +1498,138 @@ mod lib_module_tests {
         assert!(before <= item.created_at && item.created_at <= after);
         assert_eq!(item.created_at, item.updated_at);
         assert_eq!(item.created_at.offset(), time::UtcOffset::UTC);
+        Ok(())
+    }
+    /// The stored row for `name`, with its UUID and revision.
+    fn row(v: &Vault, name: &str) -> ItemRow {
+        v.db.list_items()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == name)
+            .expect("row exists")
+    }
+
+    #[test]
+    fn test_sync_identifiers_readable_while_locked() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("vault.sqlite3");
+        let mut v = Vault::open_or_create(Some(&path))?;
+        // Before initialize: the identifiers exist and the vault is still uninitialized.
+        assert!(!v.is_initialized());
+        let vault_uuid = v.vault_uuid()?;
+        let device_id = v.device_id()?;
+        assert_ne!(vault_uuid, Uuid::nil());
+        assert_ne!(device_id, Uuid::nil());
+        assert_eq!(v.high_water_mark()?, (0, 0));
+
+        v.initialize("m")?;
+        v.unlock("m")?;
+        let t = time::macros::datetime!(2026-02-03 04:05:06.007 UTC);
+        let clock = Arc::new(ManualClock::new(t));
+        let mut v = Vault::open_or_create_with_clock(Some(&path), clock)?;
+        v.unlock("m")?;
+        v.create_item(&new_note("a"))?;
+        v.lock();
+
+        assert!(!v.is_unlocked());
+        assert_eq!(v.vault_uuid()?, vault_uuid);
+        assert_eq!(v.device_id()?, device_id);
+        assert_eq!(v.high_water_mark()?, (unix_millis(t), 0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_and_edit_revisions_come_from_vault_clock() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06.789 UTC);
+        let (mut v, clock) = manual_vault(&dir, t0)?;
+        let device_id = v.device_id()?;
+
+        v.create_item(&new_note("a"))?;
+        let created = row(&v, "a");
+        assert_eq!(
+            created.revision,
+            Revision {
+                wall_ms: unix_millis(t0),
+                counter: 0,
+                device_id
+            }
+        );
+
+        clock.advance(time::Duration::milliseconds(1));
+        v.update_item(created.id, "v2")?;
+        let edited = row(&v, "a");
+        assert_eq!(edited.uuid, created.uuid);
+        assert_eq!(
+            edited.revision,
+            Revision {
+                wall_ms: unix_millis(t0) + 1,
+                counter: 0,
+                device_id
+            }
+        );
+        assert_eq!(v.high_water_mark()?, (unix_millis(t0) + 1, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_clock_rollback_edit_still_gets_greater_revision() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, clock) = manual_vault(&dir, t)?;
+        v.create_item(&new_note("a"))?;
+        let before = row(&v, "a");
+
+        let earlier = t - time::Duration::hours(1);
+        clock.set(earlier);
+        v.update_item(before.id, "v2")?;
+        let after = row(&v, "a");
+
+        assert!(after.revision > before.revision);
+        assert_eq!(after.revision.wall_ms, before.revision.wall_ms);
+        assert_eq!(after.revision.counter, before.revision.counter + 1);
+        assert_eq!(after.uuid, before.uuid);
+        assert_eq!(after.updated_at, earlier, "updated_at shows the clock reading as is");
+        assert_eq!(after.created_at, t);
+        assert_eq!(v.get_item_by_name("a")?.expect("exists").value, "v2");
+        Ok(())
+    }
+
+    #[test]
+    fn test_future_dated_high_water_mark_orders_later_creates_after() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let present = time::macros::datetime!(2026-11-17 00:00:00 UTC);
+        let future = time::macros::datetime!(2399-01-01 00:00:00 UTC);
+        let (mut v, clock) = manual_vault(&dir, future)?;
+        v.create_item(&new_note("from-future"))?;
+        let first = row(&v, "from-future");
+        assert_eq!(first.revision.wall_ms, unix_millis(future));
+
+        clock.set(present);
+        v.create_item(&new_note("from-present"))?;
+        let second = row(&v, "from-present");
+
+        assert!(second.revision > first.revision);
+        assert_eq!(second.revision.wall_ms, unix_millis(future));
+        assert_eq!(second.revision.counter, 1);
+        assert_eq!(second.created_at, present);
+        assert_ne!(second.uuid, first.uuid);
+        Ok(())
+    }
+
+    #[test]
+    fn test_vault_duplicate_name_still_refused() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, clock) = manual_vault(&dir, t)?;
+        v.create_item(&new_note("a"))?;
+        let hwm = v.high_water_mark()?;
+
+        clock.advance(time::Duration::hours(1));
+        let err = v.create_item(&new_note("a")).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(v.list_items()?.len(), 1);
+        assert_eq!(v.high_water_mark()?, hwm);
         Ok(())
     }
 }
