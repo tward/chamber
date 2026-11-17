@@ -582,20 +582,33 @@ impl Vault {
         let rows = self.db.list_items()?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            let plaintext = aead_decrypt(vk, &r.nonce, &r.ciphertext, &r.ad())?;
-            let value = String::from_utf8(plaintext)?;
-            out.push(Item {
-                id: r.id,
-                name: r.name,
-                kind: ItemKind::from_str(&r.kind)?,
-                value,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-                uuid: r.uuid,
-                revision: r.revision,
-            });
+            out.push(Self::decrypt_row(vk, r)?);
         }
         Ok(out)
+    }
+
+    /// Turns one stored row into an [`Item`] with the vault key `vk`.
+    ///
+    /// The value is decrypted with the row's own associated data ([`ItemRow::ad`]), checked
+    /// as UTF-8, and the stored `kind` is parsed into an [`ItemKind`].
+    ///
+    /// # Errors
+    /// - The decryption fails, for example because the row was sealed under another key.
+    /// - The plaintext is not valid UTF-8.
+    /// - The stored `kind` is not a known [`ItemKind`].
+    fn decrypt_row(vk: &KeyMaterial, r: ItemRow) -> Result<Item> {
+        let plaintext = aead_decrypt(vk, &r.nonce, &r.ciphertext, &r.ad())?;
+        let value = String::from_utf8(plaintext)?;
+        Ok(Item {
+            id: r.id,
+            name: r.name,
+            kind: ItemKind::from_str(&r.kind)?,
+            value,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            uuid: r.uuid,
+            revision: r.revision,
+        })
     }
 
     /// Returns every item whose name equals `name` exactly (case-sensitive), in the order
@@ -819,20 +832,31 @@ impl Vault {
     /// - `Ok(())`: If the operation is successful.
     /// - `Err`: Returns an error in the following scenarios:
     ///   - If the encryption key (`self.key`) is not available (locked).
-    ///   - If the specified item with the given `id` is not found in the list.
+    ///   - If no stored row has the local row ID `id`.
+    ///   - If the target row's own stored value cannot be decrypted or parsed.
     ///   - If there's any failure during the encryption or database update.
     ///
     /// # Behavior
-    /// 1. Verifies that the encryption key (`self.key`) is available. If not, an error is returned.
-    /// 2. Retrieves the list of items stored and searches for the item matching the provided `id`.
-    /// 3. If the item is found, constructs authenticated data (AD) using the item's metadata (name and kind).
-    /// 4. Encrypts the `new_value` using the encryption key (`vk`), the new value, and the constructed AD.
+    /// 1. Verifies that the encryption key (`self.key`) is available. If not, an error is returned
+    ///    before the database is touched.
+    /// 2. Reads the one stored row whose local row ID is `id`. No other row is read or decrypted,
+    ///    so an entry elsewhere in the vault that the local key cannot decrypt (a merge can store
+    ///    one) does not block the update.
+    /// 3. Decrypts the target row and parses its kind, exactly as [`Vault::list_items`] does for
+    ///    each row, so a target whose own value does not decrypt still fails.
+    /// 4. Encrypts the `new_value` with the encryption key (`vk`) and authenticated data (AD) built
+    ///    from the item's name and kind.
     /// 5. Updates the item in the database with the newly encrypted value and its corresponding nonce.
+    ///
+    /// Nothing is written when any step before 5 fails.
     ///
     /// # Errors
     /// - If the encryption key is missing, an `eyre!("Locked")` error is returned.
-    /// - If the item is not found, an `eyre!("Item not found")` error is returned.
-    /// - Any failures during encryption or database operations propagate as errors.
+    /// - If no row has the ID `id`, an `eyre!("Item not found")` error is returned.
+    /// - If the target row's stored value fails to decrypt, is not valid UTF-8, or has an
+    ///   unknown kind, that error is returned.
+    /// - Any failures while reading the row, encrypting, or updating the database propagate as
+    ///   errors.
     ///
     /// # Timestamps and revision
     /// `updated_at` is set to one reading of the vault's clock; `created_at` is unchanged. The
@@ -842,12 +866,9 @@ impl Vault {
     pub fn update_item(&mut self, id: u64, new_value: &str) -> Result<()> {
         let vk = self.key.as_ref().ok_or_else(|| eyre!("Locked"))?;
 
-        // Get the item to preserve name and kind for AD
-        let items = self.list_items()?;
-        let item = items
-            .iter()
-            .find(|i| i.id == id)
-            .ok_or_else(|| eyre!("Item not found"))?;
+        // Read and decrypt only the target row; its name and kind are preserved for the AD.
+        let row = self.db.item_by_id(id)?.ok_or_else(|| eyre!("Item not found"))?;
+        let item = Self::decrypt_row(vk, row)?;
 
         // Encrypt new value with same AD (name and kind)
         let nonce_cipher = aead_encrypt(
@@ -1953,6 +1974,121 @@ mod lib_module_tests {
             v.list_items().is_err(),
             "the local key cannot decrypt the carried entry"
         );
+        Ok(())
+    }
+
+    /// An entry sealed under another vault's key, which the local key cannot decrypt.
+    fn undecryptable_entry(at: OffsetDateTime) -> SyncEntry {
+        SyncEntry {
+            uuid: Uuid::from_bytes([0x42; 16]),
+            name: "foreign".into(),
+            kind: "note".into(),
+            nonce: vec![0x13; 24],
+            ciphertext: b"sealed under another vault's key".to_vec(),
+            created_at: at,
+            updated_at: at,
+            revision: Revision {
+                wall_ms: 1_000,
+                counter: 0,
+                device_id: Uuid::from_bytes([0x99; 16]),
+            },
+        }
+    }
+
+    /// Merges `entry` into `v` and checks it was added.
+    fn merge_one(v: &mut Vault, entry: &SyncEntry) -> Result<()> {
+        let counts = v.merge_sync_state(&SyncState {
+            entries: vec![entry.clone()],
+            tombstones: vec![],
+        })?;
+        assert_eq!(counts.added, 1);
+        Ok(())
+    }
+
+    /// The exported entry with UUID `uuid`, as stored.
+    fn exported_entry(v: &Vault, uuid: Uuid) -> Result<SyncEntry> {
+        Ok(v.export_sync_state()?
+            .entries
+            .into_iter()
+            .find(|e| e.uuid == uuid)
+            .expect("entry exists"))
+    }
+
+    #[test]
+    fn test_update_item_ignores_other_undecryptable_entry() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, clock) = manual_vault(&dir, t0)?;
+        v.create_item(&new_note("local"))?;
+        let before = row(&v, "local");
+
+        let foreign = undecryptable_entry(t0);
+        merge_one(&mut v, &foreign)?;
+        assert!(
+            v.list_items().is_err(),
+            "precondition: listing fails on the foreign entry"
+        );
+
+        clock.advance(time::Duration::hours(1));
+        v.update_item(before.id, "v2")?;
+
+        let after = row(&v, "local");
+        let vk = v.key.as_ref().expect("unlocked");
+        let plaintext = aead_decrypt(vk, &after.nonce, &after.ciphertext, &after.ad())?;
+        assert_eq!(plaintext, b"v2");
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.uuid, before.uuid);
+        assert!(after.revision > before.revision);
+        assert_eq!(after.updated_at, t0 + time::Duration::hours(1));
+
+        assert_eq!(exported_entry(&v, foreign.uuid)?, foreign);
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_item_unknown_id_with_undecryptable_entry() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, clock) = manual_vault(&dir, t0)?;
+        v.create_item(&new_note("local"))?;
+        let foreign = undecryptable_entry(t0);
+        merge_one(&mut v, &foreign)?;
+        let local = row(&v, "local");
+        let unknown = local.id.max(row(&v, "foreign").id) + 1;
+        let hwm = v.high_water_mark()?;
+
+        clock.advance(time::Duration::hours(1));
+        let err = v.update_item(unknown, "v2").expect_err("no row has this ID");
+        assert_eq!(err.to_string(), "Item not found");
+
+        assert_eq!(v.high_water_mark()?, hwm);
+        assert_eq!(row(&v, "local").revision, local.revision);
+        assert_eq!(exported_entry(&v, foreign.uuid)?, foreign);
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_item_undecryptable_target_writes_nothing() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, clock) = manual_vault(&dir, t0)?;
+        let foreign = undecryptable_entry(t0);
+        merge_one(&mut v, &foreign)?;
+        let before = row(&v, "foreign");
+        let hwm = v.high_water_mark()?;
+
+        clock.advance(time::Duration::hours(1));
+        assert!(
+            v.update_item(before.id, "v2").is_err(),
+            "the target's own value does not decrypt"
+        );
+
+        let after = row(&v, "foreign");
+        assert_eq!(after.nonce, before.nonce);
+        assert_eq!(after.ciphertext, before.ciphertext);
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(v.high_water_mark()?, hwm);
         Ok(())
     }
 

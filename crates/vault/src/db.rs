@@ -385,33 +385,44 @@ impl Db {
     /// - If a row's `uuid` or `rev_device_id` is not a 16-byte blob, or its `rev_counter` does
     ///   not fit in a `u32`.
     pub fn list_items(&self) -> Result<Vec<ItemRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, kind, nonce, ciphertext, created_at, updated_at, \
-             uuid, rev_wall_ms, rev_counter, rev_device_id \
-             FROM items ORDER BY name ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(ItemRow {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                kind: r.get(2)?,
-                nonce: r.get(3)?,
-                ciphertext: r.get(4)?,
-                created_at: parse_timestamp(5, &r.get::<_, String>(5)?)?,
-                updated_at: parse_timestamp(6, &r.get::<_, String>(6)?)?,
-                uuid: Uuid::from_bytes(r.get::<_, [u8; 16]>(7)?),
-                revision: Revision {
-                    wall_ms: wall_ms_from_sql(r.get(8)?),
-                    counter: r.get(9)?,
-                    device_id: Uuid::from_bytes(r.get::<_, [u8; 16]>(10)?),
-                },
-            })
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {ITEM_ROW_COLUMNS} FROM items ORDER BY name ASC"))?;
+        let rows = stmt.query_map([], item_row_from_sql)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Retrieves the one item whose local row ID is `id`, still encrypted.
+    ///
+    /// The row carries the same columns, parsed the same way, as each row of
+    /// [`Db::list_items`]. No other row is read.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(ItemRow))`: a row with this ID exists.
+    /// - `Ok(None)`: no row has this ID.
+    ///
+    /// # Errors
+    ///
+    /// This method will return an error in the following cases:
+    /// - If preparing or executing the query fails.
+    /// - If the `created_at` or `updated_at` fields fail to parse from an RFC 3339 formatted string.
+    /// - If the row's `uuid` or `rev_device_id` is not a 16-byte blob, or its `rev_counter` does
+    ///   not fit in a `u32`.
+    pub(crate) fn item_by_id(&self, id: u64) -> Result<Option<ItemRow>> {
+        let row = self
+            .conn
+            .query_row(
+                &format!("SELECT {ITEM_ROW_COLUMNS} FROM items WHERE id = ?1"),
+                params![id],
+                item_row_from_sql,
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// Deletes the item with the local row ID `id` and records its entry UUID as a tombstone.
@@ -715,7 +726,30 @@ pub(crate) fn parse_timestamp(idx: usize, text: &str) -> rusqlite::Result<Offset
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e)))
 }
 
-/// One stored item, still encrypted, as returned by [`Db::list_items`].
+/// The `items` columns that [`item_row_from_sql`] reads, in the order it reads them.
+const ITEM_ROW_COLUMNS: &str = "id, name, kind, nonce, ciphertext, created_at, updated_at, \
+     uuid, rev_wall_ms, rev_counter, rev_device_id";
+
+/// Builds an [`ItemRow`] from a result row selected with [`ITEM_ROW_COLUMNS`].
+fn item_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRow> {
+    Ok(ItemRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        kind: r.get(2)?,
+        nonce: r.get(3)?,
+        ciphertext: r.get(4)?,
+        created_at: parse_timestamp(5, &r.get::<_, String>(5)?)?,
+        updated_at: parse_timestamp(6, &r.get::<_, String>(6)?)?,
+        uuid: Uuid::from_bytes(r.get::<_, [u8; 16]>(7)?),
+        revision: Revision {
+            wall_ms: wall_ms_from_sql(r.get(8)?),
+            counter: r.get(9)?,
+            device_id: Uuid::from_bytes(r.get::<_, [u8; 16]>(10)?),
+        },
+    })
+}
+
+/// One stored item, still encrypted, as returned by [`Db::list_items`] and `Db::item_by_id`.
 pub struct ItemRow {
     /// The local row ID. It is specific to this database file and never shared.
     pub id: u64,
