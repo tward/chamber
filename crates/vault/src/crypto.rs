@@ -353,7 +353,10 @@ pub const HKDF_SHA256_MAX_OUTPUT: usize = 255 * SHA256_LEN;
 /// An empty `salt` behaves as the RFC's default of 32 zero bytes: HMAC pads a key shorter than the
 /// hash block with zeros, so the two produce the same pseudorandom key.
 ///
-/// The intermediate pseudorandom key and output blocks are zeroized before returning.
+/// The pseudorandom key buffer and the expand step's block buffer are zeroized before returning.
+/// The temporaries returned by `finalize` (in the extract step and in every expand iteration) and
+/// the keyed HMAC states (the extract state keyed with `salt`, and each expand state keyed with the
+/// pseudorandom key) are dropped but not zeroized.
 ///
 /// # Errors
 /// Returns an error, leaving `okm` unchanged, when `okm` is longer than

@@ -26,9 +26,11 @@ The crate owns everything offline synchronization needs; the CLI only gathers in
   broke. The `enroll` module writes and reads enrollment packages (`Vault::write_enrollment_package`,
   `EnrollmentPackage::read_file` and `open`, `Vault::join_enrollment`) sealed under a `TransferSecret`.
 - **Publish and merge through a sync directory**: `Vault::publish_snapshot` and `Vault::merge_snapshots` take an
-  unlocked vault and a sync directory and return a `PublishReport` or a `MergeReport`. `resolve_sync_dir` applies the
-  explicit path, then `CHAMBER_SYNC_DIR` (`SYNC_DIR_ENV`), then `default_sync_dir`. Neither operation touches the
-  terminal, decrypts a secret value, or writes plaintext to disk.
+  unlocked vault and a sync directory and return a `PublishReport` or a `MergeReport`. `resolve_sync_dir` picks the
+  directory from its arguments: the explicit path, then the value of `CHAMBER_SYNC_DIR` (`SYNC_DIR_ENV`), then
+  `default_sync_dir`. The caller reads `CHAMBER_SYNC_DIR` and passes its value (an empty value counts as unset);
+  the function does not read the environment. Neither operation touches the terminal, decrypts a secret value, or
+  writes plaintext to disk.
 - **Clock seam**: item writes read the time through the `Clock` trait. `Vault::open_or_create` uses `SystemClock`,
   and `Vault::open_or_create_with_clock` accepts any clock, such as a `ManualClock` that tests set, advance, or move
   backward.
