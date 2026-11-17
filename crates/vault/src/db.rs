@@ -189,6 +189,8 @@ impl Db {
     /// - `kind`: The type or category of the item.
     /// - `nonce`: A nonce (number used once) associated with the item, typically for cryptographic purposes.
     /// - `ciphertext`: The encrypted data associated with the item.
+    /// - `now`: The time to record for the write, supplied by the caller (a `Vault` passes one
+    ///   reading of its clock). This method does not read the system clock.
     ///
     /// # Returns
     /// - `Ok(())` if the item was successfully inserted into the database.
@@ -198,17 +200,24 @@ impl Db {
     ///   - Any other underlying database or system errors are propagated.
     ///
     /// # Notes
-    /// - The `created_at` and `updated_at` timestamps are automatically generated using the current UTC time
-    ///   in RFC 3339 format.
+    /// - `now` is formatted as RFC 3339 and stored unchanged in both `created_at` and `updated_at`,
+    ///   so the two are equal on insert.
     /// - The function uses `SQLite`'s `INSERT` statement, and if a constraint violation occurs (such as a duplicate `name`),
     ///   it maps the error to a more user-friendly `anyhow` error.
     ///
     /// # Errors
     /// - Returns an error if:
-    ///   - The current timestamp could not be formatted as RFC 3339.
+    ///   - `now` could not be formatted as RFC 3339.
     ///   - There is a database insertion failure for any reason (e.g., constraint violation, I/O error).
-    pub fn insert_item(&self, name: &str, kind: &str, nonce: &[u8], ciphertext: &[u8]) -> Result<()> {
-        let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    pub fn insert_item(
+        &self,
+        name: &str,
+        kind: &str,
+        nonce: &[u8],
+        ciphertext: &[u8],
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let now = now.format(&time::format_description::well_known::Rfc3339)?;
         match self.conn.execute(
             "INSERT INTO items (name, kind, nonce, ciphertext, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
             params![name, kind, nonce, ciphertext, now, now],
@@ -317,21 +326,23 @@ impl Db {
     /// - `id`: The unique identifier of the item to be updated.
     /// - `nonce`: A reference to the byte slice representing the nonce used in encryption.
     /// - `ciphertext`: A reference to the byte slice containing the encrypted data.
+    /// - `now`: The time to record for the write, supplied by the caller (a `Vault` passes one
+    ///   reading of its clock). This method does not read the system clock.
     ///
     /// # Returns
     /// - `Result<()>`: Returns an `Ok(())` on successful update or an error if the operation fails.
     ///
     /// # Details
-    /// This method constructs the current timestamp in RFC 3339 format and updates the specified
-    /// item's `nonce`, `ciphertext`, and `updated_at` values in the `items` table. It identifies
-    /// the target item using the provided `id`. The database interaction is performed using a
-    /// connection (`self.conn`) and an SQL `UPDATE` query.
+    /// This method formats `now` as RFC 3339 and updates the specified item's `nonce`,
+    /// `ciphertext`, and `updated_at` values in the `items` table. `created_at` is left untouched.
+    /// It identifies the target item using the provided `id`. The database interaction is
+    /// performed using a connection (`self.conn`) and an SQL `UPDATE` query.
     ///
     /// # Errors
-    /// - Returns an error if the timestamp formatting fails.
+    /// - Returns an error if `now` cannot be formatted as RFC 3339.
     /// - Returns an error if the SQL execution fails.
-    pub fn update_item(&self, id: u64, nonce: &[u8], ciphertext: &[u8]) -> Result<()> {
-        let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    pub fn update_item(&self, id: u64, nonce: &[u8], ciphertext: &[u8], now: OffsetDateTime) -> Result<()> {
+        let now = now.format(&time::format_description::well_known::Rfc3339)?;
         self.conn.execute(
             "UPDATE items SET nonce = ?, ciphertext = ?, updated_at = ? WHERE id = ?",
             params![nonce, ciphertext, now, id],
@@ -376,7 +387,11 @@ mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
     use crate::{KdfParams, WrappedVaultKey};
-    use std::{fs, thread, time::Duration};
+    use std::fs;
+    use time::macros::datetime;
+
+    /// A fixed write time for tests that do not care about the exact value.
+    const T0: OffsetDateTime = datetime!(2026-03-04 05:06:07.123_456_789 UTC);
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
         let now = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
@@ -473,9 +488,10 @@ mod tests {
         let path = tmp_path("items_basic");
         let db = Db::open(&path)?;
 
-        db.insert_item("b-name", "password", b"nonce1", b"ct1")?;
-        db.insert_item("a-name", "env", b"nonce2", b"ct2")?;
-        db.insert_item("c-name", "note", b"nonce3", b"ct3")?;
+        let t_a = datetime!(2026-03-04 05:06:08 UTC);
+        db.insert_item("b-name", "password", b"nonce1", b"ct1", T0)?;
+        db.insert_item("a-name", "env", b"nonce2", b"ct2", t_a)?;
+        db.insert_item("c-name", "note", b"nonce3", b"ct3", T0)?;
 
         let rows = db.list_items()?;
         // list_items orders by name ASC
@@ -487,9 +503,11 @@ mod tests {
         assert_eq!(row.kind, "env");
         assert_eq!(row.nonce, b"nonce2");
         assert_eq!(row.ciphertext, b"ct2");
-        // created_at and updated_at should be close to now, but we just ensure they exist
-        assert!(row.created_at <= time::OffsetDateTime::now_utc());
-        assert!(row.updated_at <= time::OffsetDateTime::now_utc());
+        // Both timestamps are the caller-supplied time, stored exactly.
+        assert_eq!(row.created_at, t_a);
+        assert_eq!(row.updated_at, t_a);
+        assert_eq!(rows[1].created_at, T0);
+        assert_eq!(rows[1].updated_at, T0);
 
         fs::remove_file(path).ok();
         Ok(())
@@ -500,8 +518,8 @@ mod tests {
         let path = tmp_path("unique_name");
         let db = Db::open(&path)?;
 
-        db.insert_item("unique", "password", b"n", b"c")?;
-        let dup = db.insert_item("unique", "password", b"n2", b"c2");
+        db.insert_item("unique", "password", b"n", b"c", T0)?;
+        let dup = db.insert_item("unique", "password", b"n2", b"c2", T0);
 
         assert!(dup.is_err(), "duplicate item with same name should fail");
 
@@ -514,23 +532,24 @@ mod tests {
         let path = tmp_path("update_item");
         let db = Db::open(&path)?;
 
-        db.insert_item("item", "note", b"n0", b"c0")?;
+        let created = datetime!(2026-03-04 05:06:07 UTC);
+        let updated = datetime!(2026-03-04 05:06:07.010 UTC);
+
+        db.insert_item("item", "note", b"n0", b"c0", created)?;
         let before = db.list_items()?;
         assert_eq!(before.len(), 1);
         let id = before[0].id;
-        let before_updated = before[0].updated_at;
+        assert_eq!(before[0].updated_at, created);
 
-        // Ensure a measurable time difference for updated_at
-        thread::sleep(Duration::from_millis(10));
-
-        db.update_item(id, b"n1", b"c1")?;
+        db.update_item(id, b"n1", b"c1", updated)?;
 
         let after = db.list_items()?;
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, id);
         assert_eq!(after[0].nonce, b"n1");
         assert_eq!(after[0].ciphertext, b"c1");
-        assert!(after[0].updated_at > before_updated);
+        assert_eq!(after[0].updated_at, updated);
+        assert_eq!(after[0].created_at, created);
 
         fs::remove_file(path).ok();
         Ok(())
@@ -541,8 +560,8 @@ mod tests {
         let path = tmp_path("delete_item");
         let db = Db::open(&path)?;
 
-        db.insert_item("to-del-1", "note", b"n", b"c")?;
-        db.insert_item("to-del-2", "note", b"n2", b"c2")?;
+        db.insert_item("to-del-1", "note", b"n", b"c", T0)?;
+        db.insert_item("to-del-2", "note", b"n2", b"c2", T0)?;
         let rows = db.list_items()?;
         assert_eq!(rows.len(), 2);
         let id = rows[0].id;

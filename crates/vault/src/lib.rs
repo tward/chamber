@@ -1,5 +1,6 @@
 mod autolock;
 mod autolock_service;
+pub mod clock;
 pub mod config;
 pub mod crypto;
 pub mod db;
@@ -12,6 +13,7 @@ pub use crypto::{
     wrap_vault_key,
 };
 
+pub use clock::{Clock, ManualClock, SystemClock};
 pub use db::{Db, ItemRow};
 
 pub use crate::autolock::AutoLockConfig;
@@ -26,6 +28,7 @@ use color_eyre::eyre::eyre;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use time::OffsetDateTime;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ItemKind {
@@ -170,6 +173,7 @@ pub struct Vault {
     db: Db,
     key: Option<KeyMaterial>,
     db_path: PathBuf,
+    clock: Arc<dyn Clock>,
 }
 
 impl Vault {
@@ -179,6 +183,9 @@ impl Vault {
     /// If a path is provided, it attempts to use that specific path.
     /// If no path is provided (`None` is passed), it will determine a default database path
     /// using the `default_db_path` function.
+    ///
+    /// The vault reads item timestamps from [`SystemClock`], the real UTC clock. Use
+    /// [`Vault::open_or_create_with_clock`] to supply a different clock.
     ///
     /// # Parameters
     /// * `path` - An optional reference to a path (`Option<&Path>`). If `Some`, the database
@@ -194,6 +201,26 @@ impl Vault {
     /// * Obtaining the default database path via `default_db_path` fails.
     /// * Opening the database at the specified or default path fails.
     pub fn open_or_create(path: Option<&Path>) -> Result<Self> {
+        Self::open_or_create_with_clock(path, Arc::new(SystemClock))
+    }
+
+    /// Open an existing database or create a new one, reading item timestamps from `clock`.
+    ///
+    /// Behaves exactly like [`Vault::open_or_create`] except for where the time comes from:
+    /// `create_item` and `update_item` take one reading of `clock` per call and store it as
+    /// the item's `created_at`/`updated_at`. Whatever the clock returns is stored as is, even a
+    /// time earlier than a previous write. Clones of the returned vault share the same clock.
+    ///
+    /// # Parameters
+    /// * `path` - An optional path to the database file. If `None`, a default path is used.
+    /// * `clock` - The clock item writes read the current time from.
+    ///
+    /// # Errors
+    /// This function returns an error if:
+    /// * Obtaining the default database path via `default_db_path` fails.
+    /// * Creating the database's parent directory fails.
+    /// * Opening the database at the specified or default path fails.
+    pub fn open_or_create_with_clock(path: Option<&Path>, clock: Arc<dyn Clock>) -> Result<Self> {
         let db_path = match path {
             Some(p) => p.to_path_buf(),
             None => default_db_path()?,
@@ -205,7 +232,12 @@ impl Vault {
         }
 
         let db = Db::open(&db_path)?;
-        Ok(Self { db, key: None, db_path })
+        Ok(Self {
+            db,
+            key: None,
+            db_path,
+            clock,
+        })
     }
 
     /// Opens the default instance of a resource.
@@ -546,6 +578,9 @@ impl Vault {
     /// - If the struct's `key` field is `None`, indicating it is locked.
     /// - If encryption fails for any reason.
     /// - If the database insertion fails.
+    ///
+    /// # Timestamps
+    /// `created_at` and `updated_at` are both set to one reading of the vault's clock.
     pub fn create_item(&mut self, item: &NewItem) -> Result<()> {
         let vk = self.key.as_ref().ok_or_else(|| eyre!("Locked"))?;
         let nonce_cipher = aead_encrypt(
@@ -553,8 +588,9 @@ impl Vault {
             item.value.as_bytes(),
             ItemRow::ad_for_name_kind(&item.name, item.kind.as_str()).as_ref(),
         )?;
+        let now = self.clock.now_utc();
         self.db
-            .insert_item(&item.name, item.kind.as_str(), &nonce_cipher.0, &nonce_cipher.1)?;
+            .insert_item(&item.name, item.kind.as_str(), &nonce_cipher.0, &nonce_cipher.1, now)?;
         Ok(())
     }
 
@@ -670,6 +706,9 @@ impl Vault {
     /// - If the encryption key is missing, an `eyre!("Locked")` error is returned.
     /// - If the item is not found, an `eyre!("Item not found")` error is returned.
     /// - Any failures during encryption or database operations propagate as errors.
+    ///
+    /// # Timestamps
+    /// `updated_at` is set to one reading of the vault's clock; `created_at` is unchanged.
     pub fn update_item(&mut self, id: u64, new_value: &str) -> Result<()> {
         let vk = self.key.as_ref().ok_or_else(|| eyre!("Locked"))?;
 
@@ -687,7 +726,8 @@ impl Vault {
             ItemRow::ad_for_name_kind(&item.name, item.kind.as_str()).as_ref(),
         )?;
 
-        self.db.update_item(id, &nonce_cipher.0, &nonce_cipher.1)?;
+        let now = self.clock.now_utc();
+        self.db.update_item(id, &nonce_cipher.0, &nonce_cipher.1, now)?;
         Ok(())
     }
 
@@ -836,10 +876,12 @@ impl Clone for Vault {
     fn clone(&self) -> Self {
         // Note: This creates a new database connection
         // The key material is not cloned for security reasons
+        // The clock handle is shared, so the clone stamps items from the same clock
         Self {
             db: Db::open(&self.db_path).expect("Failed to open database connection"),
             key: None, // Don't clone the key for security
             db_path: self.db_path.clone(),
+            clock: Arc::clone(&self.clock),
         }
     }
 }
@@ -1325,6 +1367,100 @@ mod lib_module_tests {
         );
 
         dir.close()?;
+        Ok(())
+    }
+
+    fn manual_vault(dir: &tempfile::TempDir, start: OffsetDateTime) -> Result<(Vault, Arc<ManualClock>)> {
+        let clock = Arc::new(ManualClock::new(start));
+        let path = dir.path().join("vault.sqlite3");
+        let mut v = Vault::open_or_create_with_clock(Some(&path), clock.clone())?;
+        v.initialize("m")?;
+        v.unlock("m")?;
+        Ok((v, clock))
+    }
+
+    fn new_note(name: &str) -> NewItem {
+        NewItem {
+            name: name.into(),
+            kind: ItemKind::Note,
+            value: "v".into(),
+        }
+    }
+
+    #[test]
+    fn test_manual_clock_create_stamps_exact_time() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06.789_012_345 UTC);
+        let (mut v, _clock) = manual_vault(&dir, t0)?;
+
+        v.create_item(&new_note("a"))?;
+
+        let item = v.get_item_by_name("a")?.expect("exists");
+        assert_eq!(item.created_at, t0);
+        assert_eq!(item.updated_at, t0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_manual_clock_update_after_advance_and_rollback() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, clock) = manual_vault(&dir, t0)?;
+        v.create_item(&new_note("a"))?;
+        let id = v.get_item_by_name("a")?.expect("exists").id;
+
+        // Advance: updated_at follows the clock, created_at stays.
+        clock.advance(time::Duration::hours(2));
+        v.update_item(id, "v2")?;
+        let item = v.get_item_by_name("a")?.expect("exists");
+        assert_eq!(item.updated_at, t0 + time::Duration::hours(2));
+        assert_eq!(item.created_at, t0);
+
+        // Roll back to before the creation time: the earlier time is stored, not clamped.
+        let earlier = t0 - time::Duration::days(1);
+        clock.set(earlier);
+        v.update_item(id, "v3")?;
+        let item = v.get_item_by_name("a")?.expect("exists");
+        assert_eq!(item.updated_at, earlier);
+        assert_eq!(item.created_at, t0);
+        assert_eq!(item.value, "v3");
+        Ok(())
+    }
+
+    #[test]
+    fn test_clone_shares_manual_clock() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (v, clock) = manual_vault(&dir, t0)?;
+
+        let mut c = v.clone();
+        c.unlock("m")?;
+        let t1 = time::macros::datetime!(2030-01-01 00:00:00 UTC);
+        clock.set(t1);
+        c.create_item(&new_note("from-clone"))?;
+
+        let item = v.get_item_by_name("from-clone")?.expect("exists");
+        assert_eq!(item.created_at, t1);
+        assert_eq!(item.updated_at, t1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_open_or_create_uses_system_clock() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("vault.sqlite3");
+        let mut v = Vault::open_or_create(Some(&path))?;
+        v.initialize("m")?;
+        v.unlock("m")?;
+
+        let before = OffsetDateTime::now_utc();
+        v.create_item(&new_note("sys"))?;
+        let after = OffsetDateTime::now_utc();
+
+        let item = v.get_item_by_name("sys")?.expect("exists");
+        assert!(before <= item.created_at && item.created_at <= after);
+        assert_eq!(item.created_at, item.updated_at);
+        assert_eq!(item.created_at.offset(), time::UtcOffset::UTC);
         Ok(())
     }
 }
