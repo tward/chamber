@@ -189,14 +189,20 @@ impl Db {
     /// Writes metadata to the database for a secure vault system.
     ///
     /// This function performs the following operations:
-    /// 1. Serializes the given KDF (Key Derivation Function) parameters to a JSON string.
-    /// 2. Serializes the provided wrapped vault key to a byte vector (JSON format).
-    /// 3. Deletes any existing data from the `meta` table in the database.
-    /// 4. Inserts a new record into the `meta` table with the following fields:
+    /// 1. Begins an `IMMEDIATE` transaction, taking the write lock up front.
+    /// 2. Serializes the given KDF (Key Derivation Function) parameters to a JSON string.
+    /// 3. Serializes the provided wrapped vault key to a byte vector (JSON format).
+    /// 4. Deletes any existing data from the `meta` table in the database.
+    /// 5. Inserts a new record into the `meta` table with the following fields:
     ///    - `id`: The primary key, hardcoded as `1`.
     ///    - `kdf_params`: The serialized KDF parameters.
     ///    - `wrapped_key`: The serialized wrapped vault key.
     ///    - `verifier`: A cryptographic verifier (byte slice).
+    /// 6. Commits the transaction.
+    ///
+    /// The delete and the insert happen in that one transaction, so the row is replaced
+    /// atomically. On any failure the transaction is rolled back, and the previous row, if any,
+    /// is left in place and readable through [`Db::read_meta`].
     ///
     /// # Arguments
     /// * `kdf` - A reference to the `KdfParams` struct containing key derivation function parameters.
@@ -209,8 +215,12 @@ impl Db {
     ///
     /// # Errors
     /// Returns an error if:
+    /// * The transaction cannot be started (e.g., the database is locked) or committed.
     /// * Serialization of `kdf` or `wrapped` fails.
-    /// * Any SQL operation (DELETE or INSERT) fails.
+    /// * Any SQL operation (DELETE or INSERT) fails, for example because a trigger aborts it.
+    ///
+    /// In every error case the transaction is rolled back and the previous `meta` row, if any,
+    /// is unchanged.
     ///
     /// # Notes
     /// * This function assumes that the `meta` table already exists and has the following schema:
@@ -218,7 +228,11 @@ impl Db {
     /// * The `id` is fixed as `1` to allow for a single metadata record, effectively overriding any
     ///   existing metadata in the `meta` table.
     pub fn write_meta(&self, kdf: &KdfParams, wrapped: &WrappedVaultKey, verifier: &[u8]) -> Result<()> {
-        write_meta_row(&self.conn, kdf, wrapped, verifier)
+        // Dropping `tx` on an early return rolls back the DELETE, so the previous row survives.
+        let tx = self.write_transaction()?;
+        write_meta_row(&tx, kdf, wrapped, verifier)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Reads metadata from the database.
@@ -650,8 +664,13 @@ pub(crate) fn write_high_water_mark(conn: &Connection, hwm: HighWaterMark) -> Re
     Ok(())
 }
 
-/// Replaces the `meta` row with `kdf`, `wrapped`, and `verifier`, on `conn` as given: inside
-/// the caller's transaction when there is one. See [`Db::write_meta`].
+/// Replaces the `meta` row with `kdf`, `wrapped`, and `verifier`, on `conn` as given. See
+/// [`Db::write_meta`].
+///
+/// It runs a `DELETE` and then an `INSERT` and opens no transaction of its own, so the two
+/// statements are atomic only inside a transaction the caller provides. On a bare connection
+/// each statement commits by itself, and a failed insert would leave no `meta` row.
+/// [`Db::write_meta`] and [`Db::install_enrollment`] each call it inside their own transaction.
 ///
 /// # Errors
 /// Returns an error if serialization or either SQL statement fails.
@@ -824,6 +843,63 @@ mod tests {
 
         let (kdf3, wrapped3, verifier3) = db.read_meta()?.expect("meta present");
         assert_eq!(kdf3.salt, kdf_new.salt);
+        assert_eq!(wrapped3.ciphertext, wrapped_new.ciphertext);
+        assert_eq!(verifier3, verifier_new);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_meta_keeps_previous_row_when_insert_fails() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("meta_atomic.sqlite3");
+        let db = Db::open(&path)?;
+
+        let kdf = small_kdf();
+        let wrapped = mk_wrapped(0x11);
+        let verifier = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        db.write_meta(&kdf, &wrapped, &verifier)?;
+
+        {
+            let raw = Connection::open(&path)?;
+            raw.execute_batch(
+                "CREATE TRIGGER refuse_meta_insert BEFORE INSERT ON meta \
+                 BEGIN SELECT RAISE(ABORT, 'meta insert refused by test'); END;",
+            )?;
+        }
+
+        let kdf_new = KdfParams {
+            salt: vec![9, 9, 9, 9, 9, 9, 9, 9],
+            ..small_kdf()
+        };
+        let wrapped_new = mk_wrapped(0x22);
+        let verifier_new = vec![0xAA, 0xBB, 0xCC];
+
+        let err = db
+            .write_meta(&kdf_new, &wrapped_new, &verifier_new)
+            .expect_err("the trigger aborts the insert");
+        assert!(format!("{err:#}").contains("meta insert refused by test"), "{err:#}");
+
+        // The DELETE was rolled back with the failed INSERT: the original row is still there.
+        assert!(!db.is_meta_empty()?);
+        let (kdf2, wrapped2, verifier2) = db.read_meta()?.expect("previous meta row survives");
+        assert_eq!(kdf2.salt, kdf.salt);
+        assert_eq!(kdf2.m_cost_kib, kdf.m_cost_kib);
+        assert_eq!(kdf2.t_cost, kdf.t_cost);
+        assert_eq!(kdf2.p_cost, kdf.p_cost);
+        assert_eq!(wrapped2.nonce, wrapped.nonce);
+        assert_eq!(wrapped2.ciphertext, wrapped.ciphertext);
+        assert_eq!(verifier2, verifier);
+
+        // The failed write left no transaction open: once the trigger is gone it succeeds.
+        {
+            let raw = Connection::open(&path)?;
+            raw.execute_batch("DROP TRIGGER refuse_meta_insert;")?;
+        }
+        db.write_meta(&kdf_new, &wrapped_new, &verifier_new)?;
+        let (kdf3, wrapped3, verifier3) = db.read_meta()?.expect("meta present");
+        assert_eq!(kdf3.salt, kdf_new.salt);
+        assert_eq!(wrapped3.nonce, wrapped_new.nonce);
         assert_eq!(wrapped3.ciphertext, wrapped_new.ciphertext);
         assert_eq!(verifier3, verifier_new);
 
