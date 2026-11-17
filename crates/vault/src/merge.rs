@@ -1354,4 +1354,72 @@ mod tests {
         assert_eq!(merge(&db, &incoming), counts(2, 1, 1, 0));
         assert_eq!(db.high_water_mark().unwrap(), hwm(u64::MAX - 1, 0));
     }
+
+    #[test]
+    fn test_merge_failing_at_high_water_mark_write_changes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("atomic_hwm.sqlite3");
+        let db = Db::open(&path).unwrap();
+        // Seeding raises the high-water mark itself, so it happens before the trigger exists.
+        seed(
+            &db,
+            &[
+                entry(uid(0x10), "to-replace", b"old", rev(1_000, 0, dev(1))),
+                entry(uid(0x20), "to-remove", b"r", rev(1_000, 0, dev(1))),
+            ],
+            &[uid(0x30)],
+        );
+        let before = export(&db);
+        let hwm_before = db.high_water_mark().unwrap();
+
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_hwm BEFORE UPDATE ON sync_meta \
+                 BEGIN SELECT RAISE(ABORT, 'high-water mark update refused by test'); END;",
+            )
+            .unwrap();
+
+        let incoming = state(
+            &[
+                entry(uid(0x10), "to-replace", b"new", rev(2_000, 0, dev(2))),
+                entry(uid(0x40), "added", b"a", rev(3_000, 4, dev(2))),
+            ],
+            &[uid(0x20)],
+        );
+        // The merge reaches the high-water-mark write only if some incoming revision is above
+        // the current mark.
+        let greatest_incoming = incoming
+            .entries
+            .iter()
+            .map(|e| e.revision.high_water_mark())
+            .max()
+            .unwrap();
+        assert!(
+            greatest_incoming > hwm_before,
+            "{greatest_incoming:?} <= {hwm_before:?}"
+        );
+
+        // The tombstone and every entry write happen before the high-water mark is written, so
+        // the trigger fires with all of them pending in the transaction.
+        let err = db
+            .merge_sync_state(&incoming)
+            .expect_err("the trigger aborts the merge");
+        assert!(
+            format!("{err:#}").contains("high-water mark update refused by test"),
+            "{err:#}"
+        );
+
+        assert_eq!(export(&db), before, "entries and tombstones are unchanged");
+        assert_eq!(db.high_water_mark().unwrap(), hwm_before);
+
+        // Once the trigger is gone the same merge succeeds and raises the mark.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_hwm;")
+            .unwrap();
+        assert_eq!(merge(&db, &incoming), counts(1, 1, 1, 0));
+        assert_eq!(db.high_water_mark().unwrap(), greatest_incoming);
+        assert_eq!(greatest_incoming, hwm(3_000, 4));
+    }
 }
