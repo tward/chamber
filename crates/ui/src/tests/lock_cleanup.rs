@@ -11,7 +11,7 @@ use crate::app::{
     UnlockField, ViewMode, new_value_editor, wipe_editor, wipe_item, wipe_items, wipe_optional_string, wipe_string,
 };
 use crate::vault_selector::{InputField, VaultSelectorMode};
-use chamber_vault::{AutoLockConfig, Item, ItemKind};
+use chamber_vault::{AutoLockConfig, Item, ItemKind, Revision, Uuid};
 use ratatui::crossterm::event::KeyCode;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -462,6 +462,8 @@ fn wipe_item_clears_live_value() {
         value: ITEM_VALUE.to_string(),
         created_at: now,
         updated_at: now,
+        uuid: Uuid::nil(),
+        revision: Revision::default(),
     });
     wipe_item(&mut item);
     assert!(item.is_none());
@@ -481,6 +483,8 @@ fn wipe_items_empties_live_vector() {
         value: SECOND_VALUE.to_string(),
         created_at: now,
         updated_at: now,
+        uuid: Uuid::nil(),
+        revision: Revision::default(),
     }];
     wipe_items(&mut items);
     assert!(items.is_empty());

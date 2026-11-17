@@ -154,14 +154,30 @@ impl ItemKind {
     }
 }
 
+/// One decrypted vault entry, as returned by [`Vault::list_items`].
+///
+/// `value` is the decrypted secret. `uuid` and `revision` are synchronization metadata: they
+/// are not secret and are stored in plain text next to the ciphertext.
 #[derive(Debug, Clone)]
 pub struct Item {
+    /// The local row ID. It is specific to this database file and never shared.
     pub id: u64,
     pub name: String,
     pub kind: ItemKind,
+    /// The decrypted secret value.
     pub value: String,
+    /// When the item was created, as recorded by the writing device's clock. Display data only.
     pub created_at: OffsetDateTime,
+    /// When the item was last written, as recorded by the writing device's clock. Display data
+    /// only: it may go backward after a clock rollback, while `revision` never does.
     pub updated_at: OffsetDateTime,
+    /// The entry's permanent UUID, which identifies it across devices. It is minted when the
+    /// entry is created (or when its vault was migrated to schema version 1) and never changes:
+    /// not on edit, lock and unlock, or reopening the vault. When the entry is deleted, this
+    /// UUID is what [`Vault::tombstones`] records.
+    pub uuid: Uuid,
+    /// The revision of the entry's latest write. Every edit assigns a greater one.
+    pub revision: Revision,
 }
 
 #[derive(Debug, Clone)]
@@ -530,7 +546,8 @@ impl Vault {
     /// 3. For each record:
     ///    - The ciphertext is decrypted using `aead_decrypt` with the provided nonce, ciphertext, and additional authentication data (AAD).
     ///    - The decrypted plaintext is converted to a UTF-8 string to derive the item's `value`.
-    ///    - An `Item` is constructed with the decrypted and existing meta-information, such as `id`, `name`, `kind`, and timestamps.
+    ///    - An `Item` is constructed with the decrypted and existing meta-information, such as `id`, `name`, `kind`,
+    ///      timestamps, and the entry's `uuid` and current `revision`.
     /// 4. The constructed items are aggregated into a `Vec<Item>` and returned.
     ///
     /// # Errors
@@ -563,6 +580,8 @@ impl Vault {
                 value,
                 created_at: r.created_at,
                 updated_at: r.updated_at,
+                uuid: r.uuid,
+                revision: r.revision,
             });
         }
         Ok(out)
@@ -628,24 +647,42 @@ impl Vault {
         Ok(())
     }
 
-    /// Deletes an item from the database with the specified ID.
+    /// Deletes the item with the local row ID `id` and records its entry UUID as a tombstone.
     ///
     /// # Parameters
-    /// - `id` (u64): The unique identifier of the item to be deleted.
+    /// - `id` (u64): The local row ID of the item to be deleted.
     ///
     /// # Returns
-    /// - `Result<()>`: Returns `Ok(())` if the item is successfully deleted, or an error if the deletion fails.
+    /// - `Ok(())` if the item was deleted, and also when no item has this `id` (nothing is
+    ///   recorded then).
+    ///
+    /// # Behavior
+    /// [`Db::delete_item`] removes the row and adds its UUID to the tombstones in one
+    /// transaction, so either both happen or neither does. The delete assigns no revision and
+    /// leaves the high-water mark unchanged. Tombstones are permanent and can be read with
+    /// [`Vault::tombstones`]; creating an item under the deleted item's name later is an
+    /// ordinary create with a fresh UUID, and the old tombstone stays.
     ///
     /// # Errors
     /// This function will return an error if:
     /// - The vault is locked (no vault key is loaded). This returns `eyre!("Locked")` before the
-    ///   database is touched.
-    /// - There is a failure in the underlying database operation.
+    ///   database is touched, so no tombstone is written.
+    /// - There is a failure in the underlying database operation. Nothing is written then.
     pub fn delete_item(&mut self, id: u64) -> Result<()> {
         if self.key.is_none() {
             return Err(eyre!("Locked"));
         }
         self.db.delete_item(id)
+    }
+
+    /// Returns the entry UUID of every item deleted from this vault, ascending by bytes.
+    ///
+    /// Tombstones are plain metadata: this needs no key and works on a locked vault.
+    ///
+    /// # Errors
+    /// Returns an error if the database cannot be read.
+    pub fn tombstones(&self) -> Result<Vec<Uuid>> {
+        self.db.tombstones()
     }
 
     /// Changes the master key for the vault.
@@ -1630,6 +1667,160 @@ mod lib_module_tests {
         assert!(err.to_string().contains("already exists"), "{err}");
         assert_eq!(v.list_items()?.len(), 1);
         assert_eq!(v.high_water_mark()?, hwm);
+        Ok(())
+    }
+
+    // ---- Entry identity and tombstones ----
+
+    /// The listed item named `name`.
+    fn listed(v: &Vault, name: &str) -> Item {
+        v.get_item_by_name(name).unwrap().expect("item exists")
+    }
+
+    #[test]
+    fn test_list_items_exposes_stored_uuid_and_revision() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, clock) = manual_vault(&dir, t0)?;
+        v.create_item(&new_note("a"))?;
+        v.create_item(&new_note("b"))?;
+
+        for item in v.list_items()? {
+            let stored = row(&v, &item.name);
+            assert_eq!((item.uuid, item.revision), (stored.uuid, stored.revision));
+            assert_ne!(item.uuid, Uuid::nil());
+        }
+        let created = listed(&v, "a");
+        assert_ne!(created.uuid, listed(&v, "b").uuid);
+
+        // Edit: same UUID, greater revision, and still what the row holds.
+        clock.advance(time::Duration::seconds(1));
+        v.update_item(created.id, "v2")?;
+        let edited = listed(&v, "a");
+        assert_eq!(edited.uuid, created.uuid);
+        assert!(edited.revision > created.revision);
+        let stored = row(&v, "a");
+        assert_eq!((edited.uuid, edited.revision), (stored.uuid, stored.revision));
+
+        // Lock and unlock: unchanged.
+        v.lock();
+        v.unlock("m")?;
+        let relocked = listed(&v, "a");
+        assert_eq!((relocked.uuid, relocked.revision), (edited.uuid, edited.revision));
+
+        // Reopen the database: unchanged.
+        drop(v);
+        let mut v = Vault::open_or_create_with_clock(Some(&dir.path().join("vault.sqlite3")), clock)?;
+        v.unlock("m")?;
+        let reopened = listed(&v, "a");
+        assert_eq!((reopened.uuid, reopened.revision), (edited.uuid, edited.revision));
+        Ok(())
+    }
+
+    #[test]
+    fn test_vault_delete_records_tombstone() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, _clock) = manual_vault(&dir, t0)?;
+        v.create_item(&new_note("keep"))?;
+        v.create_item(&new_note("gone"))?;
+        let keep = listed(&v, "keep");
+        let gone = listed(&v, "gone");
+        let hwm = v.high_water_mark()?;
+
+        v.delete_item(gone.id)?;
+
+        let remaining = v.list_items()?;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!((remaining[0].uuid, remaining[0].revision), (keep.uuid, keep.revision));
+        assert_eq!(v.tombstones()?, vec![gone.uuid]);
+        assert_eq!(v.high_water_mark()?, hwm);
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_on_locked_vault_writes_no_tombstone() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, _clock) = manual_vault(&dir, t0)?;
+        v.create_item(&new_note("a"))?;
+        let item = listed(&v, "a");
+        v.lock();
+
+        let err = v.delete_item(item.id).unwrap_err();
+        assert_eq!(err.to_string(), "Locked");
+        assert!(v.tombstones()?.is_empty());
+
+        v.unlock("m")?;
+        assert_eq!(listed(&v, "a").uuid, item.uuid, "the item is still there");
+        Ok(())
+    }
+
+    #[test]
+    fn test_tombstones_readable_while_locked_and_after_reopen() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, clock) = manual_vault(&dir, t0)?;
+        v.create_item(&new_note("a"))?;
+        let item = listed(&v, "a");
+        v.delete_item(item.id)?;
+
+        v.lock();
+        assert!(!v.is_unlocked());
+        assert_eq!(v.tombstones()?, vec![item.uuid]);
+
+        drop(v);
+        let v = Vault::open_or_create_with_clock(Some(&dir.path().join("vault.sqlite3")), clock)?;
+        assert!(!v.is_unlocked());
+        assert_eq!(v.tombstones()?, vec![item.uuid]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_recreate_after_delete_gets_new_uuid_and_keeps_tombstone() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, clock) = manual_vault(&dir, t0)?;
+        v.create_item(&new_note("reused"))?;
+        let old = listed(&v, "reused");
+        v.delete_item(old.id)?;
+
+        clock.advance(time::Duration::seconds(1));
+        v.create_item(&NewItem {
+            name: "reused".into(),
+            kind: ItemKind::Password,
+            value: "second".into(),
+        })?;
+
+        let new = listed(&v, "reused");
+        assert_ne!(new.uuid, old.uuid);
+        assert_eq!(new.value, "second");
+        assert_eq!(new.kind, ItemKind::Password);
+        assert!(new.revision > old.revision);
+        assert_eq!(v.list_items()?.len(), 1);
+        assert_eq!(v.tombstones()?, vec![old.uuid]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_two_deletes_record_two_tombstones_in_byte_order() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let t0 = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        let (mut v, _clock) = manual_vault(&dir, t0)?;
+        v.create_item(&new_note("a"))?;
+        v.create_item(&new_note("b"))?;
+        v.create_item(&new_note("c"))?;
+        let a = listed(&v, "a");
+        let c = listed(&v, "c");
+
+        v.delete_item(c.id)?;
+        v.delete_item(a.id)?;
+
+        let mut expected = vec![a.uuid, c.uuid];
+        expected.sort_by_key(|u| *u.as_bytes());
+        assert_eq!(v.tombstones()?, expected);
+        assert_eq!(v.list_items()?.len(), 1);
+        assert_eq!(listed(&v, "b").name, "b");
         Ok(())
     }
 }

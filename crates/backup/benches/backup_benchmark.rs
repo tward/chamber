@@ -1,5 +1,5 @@
 use chamber_backup::{BackupManager, VaultOperations};
-use chamber_vault::{BackupConfig, Item, ItemKind};
+use chamber_vault::{BackupConfig, Item, ItemKind, Revision, Uuid};
 use color_eyre::Result;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::time::Duration;
@@ -24,6 +24,8 @@ impl MockVault {
                 value: format!("benchmark_password_{i}_with_additional_content_to_simulate_real_world_data"),
                 created_at: OffsetDateTime::now_utc(),
                 updated_at: OffsetDateTime::now_utc(),
+                uuid: Uuid::nil(),
+                revision: Revision::default(),
             })
             .collect();
 

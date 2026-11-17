@@ -1,5 +1,5 @@
 use chamber_import_export::{ExportFormat, export_items, import_items};
-use chamber_vault::{Item, ItemKind};
+use chamber_vault::{Item, ItemKind, Revision, Uuid};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::time::Duration;
@@ -21,6 +21,8 @@ fn create_test_items(count: usize) -> Vec<Item> {
             value: format!("test_value_{i}_with_some_longer_content_to_simulate_real_data"),
             created_at: OffsetDateTime::now_utc(),
             updated_at: OffsetDateTime::now_utc(),
+            uuid: Uuid::nil(),
+            revision: Revision::default(),
         })
         .collect()
 }

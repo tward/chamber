@@ -160,6 +160,7 @@ pub fn format_relative_time(datetime: OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chamber_vault::{Revision, Uuid};
     use time::macros::datetime;
 
     // Helper function to create test items
@@ -172,6 +173,8 @@ mod tests {
             value: "test_value".to_string(),
             created_at,
             updated_at: created_at,
+            uuid: Uuid::nil(),
+            revision: Revision::default(),
         }
     }
 

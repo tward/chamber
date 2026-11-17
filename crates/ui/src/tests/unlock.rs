@@ -6,7 +6,7 @@ use super::support::{
     unlock,
 };
 use crate::app::{Screen, wipe_items};
-use chamber_vault::{AutoLockConfig, Item, ItemKind, NewItem};
+use chamber_vault::{AutoLockConfig, Item, ItemKind, NewItem, Revision, Uuid};
 use color_eyre::eyre::eyre;
 use ratatui::crossterm::event::KeyCode;
 use std::time::Duration;
@@ -226,6 +226,8 @@ fn wipe_items_empties_live_buffer() {
             value: format!("synthetic-value-{id}"),
             created_at: now,
             updated_at: now,
+            uuid: Uuid::nil(),
+            revision: Revision::default(),
         })
         .collect();
 

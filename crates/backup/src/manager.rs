@@ -390,7 +390,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::panic)]
     use super::*;
-    use chamber_vault::{BackupConfig, Item, ItemKind};
+    use chamber_vault::{BackupConfig, Item, ItemKind, Revision, Uuid};
     use color_eyre::Result;
     use std::fs;
     use tempfile::TempDir;
@@ -435,6 +435,8 @@ mod tests {
             value: "test_value".to_string(),
             created_at: OffsetDateTime::now_utc(),
             updated_at: OffsetDateTime::now_utc(),
+            uuid: Uuid::nil(),
+            revision: Revision::default(),
         }
     }
 
@@ -584,6 +586,8 @@ mod tests {
                 value: "secret123".to_string(),
                 created_at: OffsetDateTime::now_utc(),
                 updated_at: OffsetDateTime::now_utc(),
+                uuid: Uuid::nil(),
+                revision: Revision::default(),
             },
             Item {
                 id: 2,
@@ -592,6 +596,8 @@ mod tests {
                 value: "api_key_abc".to_string(),
                 created_at: OffsetDateTime::now_utc(),
                 updated_at: OffsetDateTime::now_utc(),
+                uuid: Uuid::nil(),
+                revision: Revision::default(),
             },
         ];
 

@@ -400,25 +400,66 @@ impl Db {
         Ok(out)
     }
 
-    /// Deletes an item from the database with the specified `id`.
+    /// Deletes the item with the local row ID `id` and records its entry UUID as a tombstone.
     ///
     /// # Arguments
     ///
-    /// * `id` - A 64-bit integer representing the unique identifier of the item to be deleted.
+    /// * `id` - The local row ID of the item to delete.
     ///
     /// # Returns
     ///
-    /// * `Ok(())` - If the operation is successful and the item is deleted.
-    /// * `Err` - If there is an error during the database operation.
+    /// * `Ok(())` when the item was deleted, and also when no item has this `id`.
+    ///
+    /// # Behavior
+    /// Everything happens in one `IMMEDIATE` transaction:
+    /// 1. The entry UUID of the row with this `id` is looked up. If there is no such row,
+    ///    nothing is written and `Ok(())` is returned.
+    /// 2. The UUID is added to `tombstones`.
+    /// 3. The row is deleted from `items`.
+    ///
+    /// Recording the tombstone and deleting the row both happen or neither does: if either
+    /// step fails, the transaction is rolled back and the row stays.
+    ///
+    /// A tombstone is the entry UUID alone. A delete assigns no revision and leaves the
+    /// high-water mark unchanged. Tombstones are permanent: nothing removes them, and creating a
+    /// new item under the deleted item's name mints a fresh UUID while the old tombstone stays.
     ///
     /// # Errors
     ///
     /// This function will return an error if:
-    /// * The connection to the database fails.
-    /// * The SQL execution fails.
+    /// * The row's stored `uuid` is not a 16-byte blob.
+    /// * Any database operation fails (e.g., I/O error, the database is locked, or a trigger
+    ///   aborts the delete). Nothing is written in that case.
     pub fn delete_item(&self, id: u64) -> Result<()> {
-        self.conn.execute("DELETE FROM items WHERE id = ?", params![id])?;
+        let tx = self.write_transaction()?;
+
+        let uuid: Option<[u8; 16]> = tx
+            .query_row("SELECT uuid FROM items WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        let Some(uuid) = uuid else {
+            return Ok(());
+        };
+
+        // Entry UUIDs are unique, so the UUID is normally new to `tombstones`; OR IGNORE keeps
+        // the table a set if it is already there.
+        tx.execute("INSERT OR IGNORE INTO tombstones (uuid) VALUES (?1)", params![uuid])?;
+        tx.execute("DELETE FROM items WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Returns the entry UUID of every deleted item, ascending by bytes.
+    ///
+    /// Reads plain metadata and needs no key.
+    ///
+    /// # Errors
+    /// Returns an error if the query fails or a stored tombstone is not a 16-byte blob.
+    pub fn tombstones(&self) -> Result<Vec<Uuid>> {
+        let mut stmt = self.conn.prepare("SELECT uuid FROM tombstones ORDER BY uuid ASC")?;
+        let uuids = stmt
+            .query_map([], |r| Ok(Uuid::from_bytes(r.get::<_, [u8; 16]>(0)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(uuids)
     }
 
     /// Updates an item with new encrypted data and assigns it a new revision.
@@ -1425,6 +1466,134 @@ mod tests {
         assert_eq!(db.high_water_mark()?, hwm);
         let after = db.list_items()?.remove(0);
         assert_eq!((after.revision, after.ciphertext), (before.revision, before.ciphertext));
+        Ok(())
+    }
+
+    // ---- Delete and tombstones ----
+
+    /// `(id, uuid, revision)` of every row, in `list_items` order.
+    fn identities(db: &Db) -> Vec<(u64, Uuid, Revision)> {
+        db.list_items()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id, r.uuid, r.revision))
+            .collect()
+    }
+
+    #[test]
+    fn test_delete_records_tombstone_and_keeps_other_rows() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let db = Db::open(&dir.path().join("tombstone.sqlite3"))?;
+        db.insert_item("a", "note", b"n1", b"c1", T0)?;
+        db.insert_item("b", "note", b"n2", b"c2", T0)?;
+        db.insert_item("c", "note", b"n3", b"c3", T0)?;
+        let before = identities(&db);
+        let (doomed_id, doomed_uuid, _) = before[1];
+        assert!(db.tombstones()?.is_empty());
+
+        db.delete_item(doomed_id)?;
+
+        let after = identities(&db);
+        assert_eq!(
+            after,
+            vec![before[0], before[2]],
+            "other rows keep id, UUID, and revision"
+        );
+        assert!(after.iter().all(|(id, _, _)| *id != doomed_id));
+        assert_eq!(db.tombstones()?, vec![doomed_uuid]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_missing_id_records_nothing() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let db = Db::open(&dir.path().join("tombstone_missing.sqlite3"))?;
+        db.insert_item("a", "note", b"n", b"c", T0)?;
+        let hwm = db.high_water_mark()?;
+        let before = identities(&db);
+
+        db.delete_item(before[0].0 + 100)?;
+
+        assert!(db.tombstones()?.is_empty());
+        assert_eq!(db.high_water_mark()?, hwm);
+        assert_eq!(identities(&db), before);
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_leaves_high_water_mark_unchanged() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let db = Db::open(&dir.path().join("tombstone_hwm.sqlite3"))?;
+        db.insert_item("a", "note", b"n1", b"c1", T0)?;
+        db.insert_item("b", "note", b"n2", b"c2", T0 + time::Duration::seconds(1))?;
+        let hwm = db.high_water_mark()?;
+        assert_ne!(hwm, HighWaterMark::default());
+
+        // Deleting the item that holds the high-water mark does not lower it.
+        let b_id = db.list_items()?.into_iter().find(|r| r.name == "b").unwrap().id;
+        db.delete_item(b_id)?;
+        assert_eq!(db.high_water_mark()?, hwm);
+
+        let a_id = db.list_items()?.remove(0).id;
+        db.delete_item(a_id)?;
+        assert_eq!(db.high_water_mark()?, hwm);
+        assert!(db.list_items()?.is_empty());
+        assert_eq!(db.tombstones()?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_is_atomic_when_row_deletion_fails() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("tombstone_atomic.sqlite3");
+        let db = Db::open(&path)?;
+        db.insert_item("a", "note", b"n", b"c", T0)?;
+        let before = identities(&db);
+        let hwm = db.high_water_mark()?;
+
+        {
+            let raw = Connection::open(&path)?;
+            raw.execute_batch(
+                "CREATE TRIGGER refuse_delete BEFORE DELETE ON items \
+                 BEGIN SELECT RAISE(ABORT, 'delete refused by test'); END;",
+            )?;
+        }
+
+        let err = db.delete_item(before[0].0).expect_err("the trigger aborts the delete");
+        assert!(format!("{err:#}").contains("delete refused by test"), "{err:#}");
+        assert_eq!(identities(&db), before, "the row is still present");
+        assert!(db.tombstones()?.is_empty(), "no tombstone was written");
+        assert_eq!(db.high_water_mark()?, hwm);
+
+        // The failed delete left no transaction open: once the trigger is gone it succeeds.
+        {
+            let raw = Connection::open(&path)?;
+            raw.execute_batch("DROP TRIGGER refuse_delete;")?;
+        }
+        db.delete_item(before[0].0)?;
+        assert_eq!(db.tombstones()?, vec![before[0].1]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tombstones_are_ascending_by_bytes() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("tombstone_order.sqlite3");
+        let db = Db::open(&path)?;
+        // Fixed UUIDs, inserted in descending order, so the result order cannot come from
+        // insertion order. The high bit of the first byte checks unsigned comparison.
+        let high = Uuid::from_bytes([0xF0; 16]);
+        let low = Uuid::from_bytes([0x01; 16]);
+        let mid = Uuid::from_bytes([0x7F; 16]);
+        for uuid in [high, low, mid] {
+            db.conn
+                .execute("INSERT INTO tombstones (uuid) VALUES (?1)", params![uuid.as_bytes()])?;
+        }
+        assert_eq!(db.tombstones()?, vec![low, mid, high]);
+
+        drop(db);
+        let db = Db::open(&path)?;
+        assert_eq!(db.tombstones()?, vec![low, mid, high], "tombstones survive reopening");
         Ok(())
     }
 }

@@ -393,7 +393,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::cast_possible_wrap)]
     use super::*;
-    use chamber_vault::{Item, ItemKind};
+    use chamber_vault::{Item, ItemKind, Revision, Uuid};
     use std::{fs, path::PathBuf};
     use time::OffsetDateTime;
 
@@ -412,6 +412,8 @@ mod tests {
             value: value.to_string(),
             created_at: now,
             updated_at: now,
+            uuid: Uuid::nil(),
+            revision: Revision::default(),
         }
     }
 
@@ -966,6 +968,8 @@ mod tests {
             value: "value".to_string(),
             created_at: far_future,
             updated_at: far_future,
+            uuid: Uuid::nil(),
+            revision: Revision::default(),
         };
 
         let exported = ExportedItem::from(&item);

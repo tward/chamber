@@ -361,7 +361,7 @@ mod tests {
     use super::*;
     use crate::crypto::hex_encode;
     use crate::registry::{VaultCategory, VaultInfo, VaultRegistry};
-    use crate::{BackupConfig, Item, ItemKind};
+    use crate::{BackupConfig, Item, ItemKind, Revision, Uuid};
     use color_eyre::Result;
     use std::collections::HashMap;
     use std::fs;
@@ -430,6 +430,8 @@ mod tests {
             value: "test_value".to_string(),
             created_at: OffsetDateTime::now_utc(),
             updated_at: OffsetDateTime::now_utc(),
+            uuid: Uuid::nil(),
+            revision: Revision::default(),
         }
     }
 
