@@ -126,7 +126,9 @@ We provide official Docker images for containerized deployments:
 ```bash
    chamber ui
 ```
+
 #### CLI Commands
+
 ```bash
 Quick start:
 1. chamber init              # Initialize your first vault
@@ -147,6 +149,7 @@ Commands:
   stats
   backup    Backup management commands for automatic data protection
   registry  Multiple vault management commands for organizing secrets
+  sync      Synchronize this vault with your other machines through a sync directory
   help      Print this message or the help of the given subcommand(s)
 ```
 
@@ -834,14 +837,22 @@ graph TB
     style Retention fill:#fce4ec
 ```
 ### Core Components
+
 #### Vault Module (`crates/vault`)
-- **Purpose**: Core business logic and data models
+
+- **Purpose**: Core business logic, data models, and offline synchronization
 - **Key Types**: `Vault`, `Item`, `ItemKind`, `NewItem`
 - **Responsibilities**:
   - Vault lifecycle management (create, initialize, unlock)
   - CRUD operations for secrets
   - Master key rotation
   - Data encryption/decryption
+  - Schema versioning with an automatic migration of older databases
+  - A revision for every create and edit, and a permanent tombstone for every delete
+  - The merge of another machine's state into the local database
+  - The `snapshot` module: encoding and validating snapshot files
+  - The `enroll` module: writing and reading enrollment packages
+  - Publishing and merging snapshots through a sync directory
 
 #### Multiple Vault Manager
 - **Purpose**: Manage multiple independent vaults
@@ -895,6 +906,7 @@ graph TB
   - Backup status monitoring
 
 ### Data Flow
+
 ``` mermaid
 sequenceDiagram
     participant User
@@ -918,6 +930,36 @@ sequenceDiagram
     Vault-->>CLI: success
     CLI-->>User: "Secret added successfully"
 ```
+
+Synchronizing with `chamber sync`:
+
+``` mermaid
+sequenceDiagram
+    participant User
+    participant CLI
+    participant Vault
+    participant SyncDir as Sync directory
+    participant Storage
+
+    User->>CLI: chamber sync
+    CLI->>User: ask for the master key
+    User-->>CLI: master key
+    CLI->>Vault: unlock(master key)
+    CLI->>Vault: merge_snapshots(sync_dir)
+    Vault->>SyncDir: list candidate .chsnap files
+    loop each candidate file
+        Vault->>SyncDir: read and validate the file
+        Vault->>Storage: merge a valid file's state in one transaction
+    end
+    Vault-->>CLI: MergeReport
+    CLI-->>User: one "Merged" or "Skipped" line per file
+    CLI->>Vault: publish_snapshot(sync_dir)
+    Vault->>Storage: read the complete state
+    Vault->>SyncDir: write a temporary file, then rename it to this machine's .chsnap file
+    Vault-->>CLI: PublishReport
+    CLI-->>User: "Published" line, non-zero exit if any file was skipped
+```
+
 ### Backup Architecture
 ``` mermaid
 flowchart TD
@@ -1719,9 +1761,9 @@ chamber sync join ~/Downloads/chamber-laptop.chenroll
 ```
 
 Chamber asks for the transfer secret, shows the vault UUID and the number of entries the package carries, and asks
-`Join this vault? [y/N]`. Check that the entry count matches the vault on the first machine, answer `y`, and choose a
-new local master password for this machine (entered twice). Any other answer cancels and changes nothing. After a
-successful join, delete the package and discard the transfer secret.
+`Join this vault? [y/N]`. Check that the entry count matches the vault on the first machine, answer `y` or `yes` (in
+any letter case), and choose a new local master password for this machine (entered twice). Any other answer cancels
+and changes nothing. After a successful join, delete the package and discard the transfer secret.
 
 From then on, run `chamber sync` on each machine whenever files arrive in its sync directory.
 
@@ -1785,12 +1827,14 @@ Reports show file names, counts, and reasons. They never include entry names or 
   ID, snapshot ID, nonce) followed by a JSON payload encrypted with XChaCha20-Poly1305, with the whole header
   authenticated as associated data.
 - **Snapshot key**: HKDF-SHA-256 of the vault key, with the vault UUID as salt.
-- **Enrollment package**: the same kind of file, encrypted under a key derived by HKDF-SHA-256 from the 128-bit
-  transfer secret and a random salt. It carries the vault state and, in addition, the vault key.
+- **Enrollment package**: its own 51-byte header (magic `CHMBSNAP`, format version, package type, salt, nonce)
+  followed by a JSON payload encrypted with XChaCha20-Poly1305, with the whole header authenticated as associated
+  data. The key is derived by HKDF-SHA-256 from the 128-bit transfer secret and the random salt in the header. The
+  payload carries the vault state and, in addition, the vault UUID and the vault key.
 - **Item values** travel as they are already stored, with their existing per-item encryption. Publishing and merging
   never decrypt a secret value and never write plaintext to disk.
-- **Visible without the key**: the file size, when files appear, the vault UUID, the publisher device ID, and the
-  snapshot ID.
+- **Visible without the key**: for every file, its size and when it appears. A snapshot file also exposes the vault
+  UUID, the publisher device ID, and the snapshot ID in its header. An enrollment package exposes none of them.
 
 ### 🛡️ Security Boundaries and Limits
 
@@ -1905,7 +1949,8 @@ We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) f
 We have a [Code of Conduct](CODE_OF_CONDUCT.md) that all contributors and participants are expected to follow.
 
 ## ⚖️ License
-This project is licensed under the MIT License—see the [LICENSE](LICENSE) file for details.
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
 ## 🙏 Acknowledgments
 
