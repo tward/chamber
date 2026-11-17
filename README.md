@@ -891,7 +891,9 @@ graph TB
 - **Database**: SQLite with WAL mode for better concurrency
 - **Schema**:
   - `meta`: Stores encrypted vault key and KDF parameters
-  - : Encrypted secrets with metadata `items`
+  - `items`: Encrypted secrets with metadata; each entry carries a permanent UUID and a revision
+  - `tombstones`: Holds the UUIDs of deleted entries
+  - `sync_meta`: Holds the vault UUID, the device ID, and the revision high-water mark
 
 - **Features**: ACID transactions, foreign key constraints, automatic migrations
 
@@ -1166,7 +1168,7 @@ chamber backup configure --compress true --verify true
 ```
 #### Manual Backup Operations
 ``` bash
-# Create a backup immediately
+# Create a backup if one is due
 chamber backup now
 
 # Force backup even if one was recently created
@@ -1175,6 +1177,16 @@ chamber backup now --force
 # Create backup with custom output location
 chamber backup now --output /path/to/custom/backup.json
 ```
+
+Without `--force`, `chamber backup now` creates nothing and exits with a non-zero status in two cases:
+
+- Automatic backups are disabled.
+- The latest backup is newer than the configured interval.
+
+In both cases the error is `No backup needed (use --force to create anyway)`.
+This holds with `--output` as well.
+Scripts and cron jobs should pass `--force` or expect that status.
+
 #### Backup Management
 ``` bash
 # List all existing backups
