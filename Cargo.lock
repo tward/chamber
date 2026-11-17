@@ -493,6 +493,7 @@ dependencies = [
  "color-eyre",
  "regex",
  "rpassword",
+ "rusqlite",
  "tempfile",
  "time",
  "tokio",

@@ -183,32 +183,61 @@ fn run_sync<W: Write>(vault: &mut Vault, sync_dir: &Path, out: &mut W) -> Result
 /// Writes one line per candidate file (merged with its counts, or skipped with the reason), or
 /// a single line saying there is nothing to merge. Only file names, counts, and rejection
 /// messages are printed.
+///
+/// Anyone who can write to the sync directory chooses the file names, so each name in a
+/// "Merged" or "Skipped" line is written through [`display_file_name`]: every control character
+/// is replaced by its `\u{..}` escape (`\u{1b}` for ESC), and nothing else is changed.
 fn write_merge_report<W: Write>(report: &MergeReport, sync_dir: &Path, out: &mut W) -> Result<()> {
     if report.is_empty() {
         writeln!(out, "Nothing to merge: no snapshot files in {}.", sync_dir.display())?;
         return Ok(());
     }
     for file in &report.files {
+        let name = display_file_name(&file.file_name);
         match &file.outcome {
             FileOutcome::Merged(counts) => writeln!(
                 out,
-                "Merged {}: {} added, {} replaced, {} removed by a tombstone, {} unchanged",
-                file.file_name, counts.added, counts.replaced, counts.removed, counts.unchanged
+                "Merged {name}: {} added, {} replaced, {} removed by a tombstone, {} unchanged",
+                counts.added, counts.replaced, counts.removed, counts.unchanged
             )?,
-            FileOutcome::Skipped(rejection) => writeln!(out, "Skipped {}: {rejection}", file.file_name)?,
+            FileOutcome::Skipped(rejection) => writeln!(out, "Skipped {name}: {rejection}")?,
         }
     }
     Ok(())
 }
 
-/// Writes the published file with its entry and tombstone counts and its snapshot ID.
+/// Renders a candidate file name for the terminal: every character for which
+/// [`char::is_control`] is true becomes its [`char::escape_unicode`] form (lowercase hexadecimal,
+/// no padding, for example `\u{1b}` for ESC and `\u{a}` for a line feed). Every other character,
+/// backslashes included, is kept as it is.
+fn display_file_name(name: &str) -> String {
+    let mut shown = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_control() {
+            shown.extend(c.escape_unicode());
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
+}
+
+/// Writes the published file with its entry and tombstone counts and its snapshot ID, for
+/// example `Published <path>: 1 entry, 2 tombstones (snapshot <id>)`. A count of one takes the
+/// singular noun; every other count, zero included, takes the plural.
 fn write_publish_report<W: Write>(publication: &PublishReport, out: &mut W) -> Result<()> {
     writeln!(
         out,
-        "Published {}: {} entries, {} tombstones (snapshot {})",
+        "Published {}: {} {}, {} {} (snapshot {})",
         publication.path.display(),
         publication.entries,
+        if publication.entries == 1 { "entry" } else { "entries" },
         publication.tombstones,
+        if publication.tombstones == 1 {
+            "tombstone"
+        } else {
+            "tombstones"
+        },
         publication.snapshot_id
     )?;
     Ok(())
@@ -386,7 +415,7 @@ mod tests {
     use crate::test_support::{MASTER_PASSWORD, new_item};
     use crate::{Cli, Commands};
     use chamber_vault::snapshot::SnapshotRejection;
-    use chamber_vault::{Db, SyncDirError, default_sync_dir, snapshot_file_name};
+    use chamber_vault::{Db, FileReport, MergeCounts, SyncDirError, default_sync_dir, snapshot_file_name};
     use clap::Parser;
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -844,12 +873,81 @@ mod tests {
         assert!(expected.is_file(), "the snapshot is published under the device ID");
         assert!(
             output.starts_with(&format!(
-                "Published {}: 1 entries, 1 tombstones (snapshot ",
+                "Published {}: 1 entry, 1 tombstone (snapshot ",
                 expected.display()
             )),
             "{output}"
         );
         assert!(!output.contains("zz-publish"), "{output}");
+    }
+
+    #[test]
+    fn publish_reports_plural_nouns_for_counts_other_than_one() {
+        let mut machine = Machine::initialized();
+        for n in 1..=4 {
+            machine.add(&format!("zz-plural-{n}"), &format!("qq-plural-{n}"));
+        }
+        for doomed in ["zz-plural-3", "zz-plural-4"] {
+            let item = machine
+                .vault
+                .list_items()
+                .unwrap()
+                .into_iter()
+                .find(|i| i.name == doomed)
+                .unwrap();
+            machine.vault.delete_item(item.id).unwrap();
+        }
+        let sync_dir = TempDir::new().unwrap();
+
+        let (result, output) = capture(|out| run_publish(&machine.vault, sync_dir.path(), out));
+
+        result.unwrap();
+        assert!(output.contains(": 2 entries, 2 tombstones (snapshot "), "{output}");
+
+        let empty = Machine::initialized();
+        let empty_dir = TempDir::new().unwrap();
+        let (result, output) = capture(|out| run_publish(&empty.vault, empty_dir.path(), out));
+        result.unwrap();
+        assert!(output.contains(": 0 entries, 0 tombstones (snapshot "), "{output}");
+    }
+
+    #[test]
+    fn merge_report_escapes_control_characters_in_file_names() {
+        let name = "evil\u{1b}[2J.chsnap";
+        let escaped = "evil\\u{1b}[2J.chsnap";
+        let report = MergeReport {
+            files: vec![
+                FileReport {
+                    file_name: name.to_string(),
+                    outcome: FileOutcome::Merged(MergeCounts::default()),
+                },
+                FileReport {
+                    file_name: name.to_string(),
+                    outcome: FileOutcome::Skipped(SnapshotRejection::BadMagic),
+                },
+            ],
+        };
+        let mut out = Vec::new();
+
+        write_merge_report(&report, Path::new("zz-sync-dir"), &mut out).unwrap();
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(
+            !output.chars().any(|c| c.is_control() && c != '\n'),
+            "only line ends are control characters: {output:?}"
+        );
+        assert!(output.contains("\\u{1b}"), "{output:?}");
+        assert!(output.contains(&format!("Merged {escaped}: ")), "{output:?}");
+        assert!(output.contains(&format!("Skipped {escaped}: ")), "{output:?}");
+    }
+
+    #[test]
+    fn display_file_name_escapes_only_control_characters() {
+        assert_eq!(display_file_name("plain-name.chsnap"), "plain-name.chsnap");
+        assert_eq!(display_file_name("a\\b\u{e9}.chsnap"), "a\\b\u{e9}.chsnap");
+        assert_eq!(display_file_name("\u{1b}[31m"), "\\u{1b}[31m");
+        assert_eq!(display_file_name("line\nbreak\r\t"), "line\\u{a}break\\u{d}\\u{9}");
+        assert_eq!(display_file_name("\u{7f}\u{9b}"), "\\u{7f}\\u{9b}");
     }
 
     #[test]
@@ -901,6 +999,55 @@ mod tests {
         assert!(
             published.is_file(),
             "the snapshot is published despite the skipped file"
+        );
+    }
+
+    #[test]
+    fn bare_sync_publishes_nothing_when_only_the_merge_fails() {
+        let mut a = Machine::initialized();
+        let mut b = joined_machine(&a.vault);
+        b.add("zz-sync-merge-fails", "qq-merge-fails-value");
+        let sync_dir = TempDir::new().unwrap();
+        run_publish(&b.vault, sync_dir.path(), &mut Vec::new()).unwrap();
+        let b_file = snapshot_file_name(b.vault.device_id().unwrap());
+        assert_eq!(file_names(sync_dir.path()), vec![b_file.clone()]);
+        let entries_before = a.names_and_values();
+
+        let trigger = rusqlite::Connection::open(a.vault.db_path()).unwrap();
+        trigger
+            .execute_batch(
+                "CREATE TRIGGER refuse_insert BEFORE INSERT ON items \
+                 BEGIN SELECT RAISE(ABORT, 'insert refused by test'); END;",
+            )
+            .unwrap();
+
+        let (result, output) = capture(|out| run_sync(&mut a.vault, sync_dir.path(), out));
+
+        let err = result.expect_err("the merge fails, so sync fails");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("insert refused by test"), "{chain}");
+        assert!(!output.contains("Published "), "{output}");
+        let a_id = a.vault.device_id().unwrap();
+        let a_file = snapshot_file_name(a_id);
+        assert!(!sync_dir.path().join(&a_file).exists(), "A's snapshot is not published");
+        assert!(
+            !sync_dir.path().join(format!(".{a_file}.tmp")).exists(),
+            "A's temporary file is not written"
+        );
+        assert_eq!(file_names(sync_dir.path()), vec![b_file]);
+        assert_eq!(a.names_and_values(), entries_before, "B's entry is not merged");
+        assert!(
+            !a.names_and_values().iter().any(|(n, _)| n == "zz-sync-merge-fails"),
+            "B's entry is not listed"
+        );
+
+        trigger.execute_batch("DROP TRIGGER refuse_insert;").unwrap();
+        drop(trigger);
+        let (published, _) = capture(|out| run_publish(&a.vault, sync_dir.path(), out));
+        published.unwrap();
+        assert!(
+            sync_dir.path().join(&a_file).is_file(),
+            "publishing did not share the merge failure"
         );
     }
 
