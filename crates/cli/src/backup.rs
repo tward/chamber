@@ -1,6 +1,6 @@
 use chamber_backup::BackupManager;
 use chamber_import_export::{detect_format_from_extension, import_items};
-use chamber_vault::{BackupConfig, Vault};
+use chamber_vault::{BackupConfig, NewItem, Vault};
 use clap::Subcommand;
 use color_eyre::eyre::eyre;
 use std::path::{Path, PathBuf};
@@ -380,6 +380,18 @@ fn handle_restore_backup(mut vault: Vault, backup_path: &Path, skip_confirmation
 
     println!("Found {} items in backup", items.len());
 
+    replace_vault_items(&mut vault, &items)?;
+    Ok(())
+}
+
+/// Replaces the contents of the unlocked `vault` with `items`: the write step of a restore.
+///
+/// Deletes every existing item, then creates each of `items`. An item that fails to be created
+/// prints a warning and is left out. Prints a summary line and returns the number created.
+///
+/// # Errors
+/// Returns an error when the existing items cannot be listed or one of them cannot be deleted.
+fn replace_vault_items(vault: &mut Vault, items: &[NewItem]) -> color_eyre::Result<usize> {
     // Clear existing items (if user confirmed)
     let existing_items = vault.list_items()?;
     for item in existing_items {
@@ -389,14 +401,14 @@ fn handle_restore_backup(mut vault: Vault, backup_path: &Path, skip_confirmation
     // Import new items
     let mut imported_count = 0;
     for item in items {
-        match vault.create_item(&item) {
+        match vault.create_item(item) {
             Ok(()) => imported_count += 1,
             Err(e) => println!("⚠️  Failed to import '{}': {}", item.name, e),
         }
     }
 
     println!("✅ Successfully imported {imported_count} items from backup");
-    Ok(())
+    Ok(imported_count)
 }
 
 fn handle_verify_backup(backup_path: &PathBuf) -> color_eyre::Result<()> {
@@ -548,4 +560,43 @@ fn verify_backup_file(backup_path: &std::path::Path) -> color_eyre::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod restore_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::test_support::{assert_recorded_creates, listed, new_item, unlocked_vault};
+
+    #[test]
+    fn restore_step_tombstones_old_entries_and_records_restored_ones_as_creates() {
+        let mut tv = unlocked_vault();
+        tv.vault.create_item(&new_item("a", "qq-old-a")).unwrap();
+        tv.vault.create_item(&new_item("b", "qq-old-b")).unwrap();
+        let old_a = listed(&tv.vault, "a");
+        let old_b = listed(&tv.vault, "b");
+        let hwm_before = tv.vault.high_water_mark().unwrap();
+
+        let restored =
+            replace_vault_items(&mut tv.vault, &[new_item("a", "qq-new-a"), new_item("c", "qq-new-c")]).unwrap();
+
+        assert_eq!(restored, 2, "both backup items are restored");
+        let mut names: Vec<String> = tv.vault.list_items().unwrap().into_iter().map(|i| i.name).collect();
+        names.sort();
+        assert_eq!(names, ["a", "c"], "exactly the backup items are listed");
+
+        let mut expected_tombstones = vec![old_a.uuid, old_b.uuid];
+        expected_tombstones.sort();
+        let mut tombstones = tv.vault.tombstones().unwrap();
+        tombstones.sort();
+        assert_eq!(
+            tombstones, expected_tombstones,
+            "the tombstones are the old UUIDs of a and b"
+        );
+
+        let created = assert_recorded_creates(&tv.vault, &["a", "c"], hwm_before);
+        assert_ne!(created[0].uuid, old_a.uuid, "the restored a has a new UUID");
+        assert_eq!(created[0].value, "qq-new-a");
+        assert_eq!(created[1].value, "qq-new-c");
+    }
 }

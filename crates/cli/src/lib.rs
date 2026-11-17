@@ -2,6 +2,8 @@ mod api;
 mod backup;
 mod health;
 mod stats;
+#[cfg(test)]
+mod test_support;
 mod utils;
 mod vault;
 
@@ -385,25 +387,12 @@ pub async fn handle_command(cmd: Commands) -> Result<()> {
             };
 
             let item = NewItem {
-                name: name.clone(),
+                name,
                 kind,
                 value: item_value,
             };
 
-            match vault.create_item(&item) {
-                Ok(()) => {
-                    println!("✅ Item '{name}' added successfully.");
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("already exists") {
-                        println!("❌ Item '{name}' already exists. Use a different name or update it.");
-                        return Ok(());
-                    }
-                    // Other errors should still bubble up
-                    return Err(e);
-                }
-            }
+            add_item_to_vault(&mut vault, &item)?;
         }
 
         Commands::Health { detailed } => {
@@ -597,39 +586,7 @@ pub async fn handle_command(cmd: Commands) -> Result<()> {
             let mut vault = Vault::open_or_create(None)?;
             vault.unlock(&master)?;
 
-            let existing_items = vault.list_items()?;
-            let existing_names: std::collections::HashSet<String> =
-                existing_items.iter().map(|item| item.name.clone()).collect();
-
-            let mut imported_count = 0;
-            let mut skipped_count = 0;
-
-            for item in new_items {
-                if existing_names.contains(&item.name) {
-                    if skip_duplicates {
-                        println!("Skipping duplicate: {}", item.name);
-                        skipped_count += 1;
-                        continue;
-                    }
-                    println!(
-                        "Warning: Item '{}' already exists and will be skipped. Use --skip-duplicates to suppress this warning.",
-                        item.name
-                    );
-                    skipped_count += 1;
-                    continue;
-                }
-
-                match vault.create_item(&item) {
-                    Ok(()) => {
-                        imported_count += 1;
-                    }
-                    Err(e) => {
-                        println!("Failed to import item: {e}");
-                    }
-                }
-            }
-
-            println!("Import complete: {imported_count} imported, {skipped_count} skipped");
+            import_new_items(&mut vault, &new_items, skip_duplicates)?;
         }
         Commands::Stats => {
             let mut vault = match Vault::open_active() {
@@ -724,45 +681,7 @@ pub async fn handle_command(cmd: Commands) -> Result<()> {
                     return Ok(());
                 }
 
-                // Update the item
-                match vault.update_item(item.id, &new_value) {
-                    Ok(()) => {
-                        println!("✅ Item '{name}' updated successfully in vault '{vault_name}'.");
-
-                        // Show password strength for password-type items
-                        if matches!(item.kind, ItemKind::Password | ItemKind::ApiKey) {
-                            let strength = analyze_password_strength(&new_value);
-                            println!("🔒 Password strength: {strength}");
-                        }
-
-                        // Copy to clipboard if requested
-                        if copy {
-                            match arboard::Clipboard::new() {
-                                Ok(mut clipboard) => {
-                                    if let Err(e) = clipboard.set_text(&new_value) {
-                                        println!("⚠️  Warning: Failed to copy to clipboard: {e}");
-                                    } else {
-                                        println!("📋 New value copied to clipboard.");
-                                    }
-                                }
-                                Err(e) => {
-                                    println!("⚠️  Warning: Failed to access clipboard: {e}");
-                                }
-                            }
-                        }
-
-                        // Show update timestamp
-                        println!(
-                            "🕐 Updated at: {}",
-                            OffsetDateTime::now_utc()
-                                .format(&time::format_description::well_known::Rfc3339)
-                                .unwrap_or_else(|_| "unknown".to_string())
-                        );
-                    }
-                    Err(e) => {
-                        return Err(eyre!("Failed to update item: {}", e));
-                    }
-                }
+                update_item_value(&mut vault, &item, &new_value, &vault_name, copy)?;
             } else {
                 println!(
                     "❌ Item '{}' not found{}.",
@@ -794,6 +713,128 @@ pub async fn handle_command(cmd: Commands) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Stores `item` in the unlocked `vault`: the write step of `Commands::Add`.
+///
+/// Prints a success line. When an item with the same name already exists, prints that and
+/// returns `Ok(())` without writing anything.
+///
+/// # Errors
+/// Returns any other error from [`Vault::create_item`].
+fn add_item_to_vault(vault: &mut Vault, item: &NewItem) -> Result<()> {
+    let name = &item.name;
+    match vault.create_item(item) {
+        Ok(()) => {
+            println!("✅ Item '{name}' added successfully.");
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("already exists") {
+                println!("❌ Item '{name}' already exists. Use a different name or update it.");
+                return Ok(());
+            }
+            // Other errors should still bubble up
+            Err(e)
+        }
+    }
+}
+
+/// Replaces the value of `item` with `new_value` in the unlocked `vault`: the write step of
+/// `Commands::Update`.
+///
+/// Prints the result, the password strength for password and API key items, and the update
+/// time. Copies `new_value` to the clipboard only when `copy` is set; otherwise the clipboard is
+/// never opened.
+///
+/// # Errors
+/// Returns an error when [`Vault::update_item`] fails.
+fn update_item_value(vault: &mut Vault, item: &Item, new_value: &str, vault_name: &str, copy: bool) -> Result<()> {
+    let name = &item.name;
+    match vault.update_item(item.id, new_value) {
+        Ok(()) => {
+            println!("✅ Item '{name}' updated successfully in vault '{vault_name}'.");
+
+            // Show password strength for password-type items
+            if matches!(item.kind, ItemKind::Password | ItemKind::ApiKey) {
+                let strength = analyze_password_strength(new_value);
+                println!("🔒 Password strength: {strength}");
+            }
+
+            // Copy to clipboard if requested
+            if copy {
+                match arboard::Clipboard::new() {
+                    Ok(mut clipboard) => {
+                        if let Err(e) = clipboard.set_text(new_value) {
+                            println!("⚠️  Warning: Failed to copy to clipboard: {e}");
+                        } else {
+                            println!("📋 New value copied to clipboard.");
+                        }
+                    }
+                    Err(e) => {
+                        println!("⚠️  Warning: Failed to access clipboard: {e}");
+                    }
+                }
+            }
+
+            // Show update timestamp
+            println!(
+                "🕐 Updated at: {}",
+                OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string())
+            );
+            Ok(())
+        }
+        Err(e) => Err(eyre!("Failed to update item: {}", e)),
+    }
+}
+
+/// Creates each of `new_items` in the unlocked `vault`, skipping names the vault already holds:
+/// the write step of `Commands::Import`.
+///
+/// A skipped item prints a "Skipping duplicate" line when `skip_duplicates` is set and a
+/// warning otherwise; both count as skipped. An item that fails to be created prints the error
+/// and counts as neither. Prints a summary line and returns `(imported, skipped)`.
+///
+/// # Errors
+/// Returns an error when the vault's existing items cannot be listed.
+fn import_new_items(vault: &mut Vault, new_items: &[NewItem], skip_duplicates: bool) -> Result<(usize, usize)> {
+    let existing_items = vault.list_items()?;
+    let existing_names: std::collections::HashSet<String> =
+        existing_items.iter().map(|item| item.name.clone()).collect();
+
+    let mut imported_count = 0;
+    let mut skipped_count = 0;
+
+    for item in new_items {
+        if existing_names.contains(&item.name) {
+            if skip_duplicates {
+                println!("Skipping duplicate: {}", item.name);
+                skipped_count += 1;
+                continue;
+            }
+            println!(
+                "Warning: Item '{}' already exists and will be skipped. Use --skip-duplicates to suppress this warning.",
+                item.name
+            );
+            skipped_count += 1;
+            continue;
+        }
+
+        match vault.create_item(item) {
+            Ok(()) => {
+                imported_count += 1;
+            }
+            Err(e) => {
+                println!("Failed to import item: {e}");
+            }
+        }
+    }
+
+    println!("Import complete: {imported_count} imported, {skipped_count} skipped");
+    Ok((imported_count, skipped_count))
 }
 
 fn is_weak_password(password: &str) -> bool {
@@ -1117,5 +1158,108 @@ mod handle_command_tests {
         };
         let err = handle_command(cmd).await.unwrap_err().to_string();
         assert!(err.contains("Input file does not exist"));
+    }
+
+    // The tests below drive the write steps behind the Add, Update, and Import commands on an
+    // unlocked temp-directory vault, and check the synchronization state each write records.
+
+    use crate::test_support::{
+        assert_recorded_create, assert_recorded_creates, assert_recorded_edit, listed, new_item, unlocked_vault,
+    };
+
+    #[test]
+    fn add_step_records_a_create() {
+        let mut tv = unlocked_vault();
+        add_item_to_vault(&mut tv.vault, &new_item("zz-cli-existing", "qq-existing-value")).unwrap();
+        let hwm_before = tv.vault.high_water_mark().unwrap();
+
+        add_item_to_vault(&mut tv.vault, &new_item("zz-cli-added", "qq-added-value")).unwrap();
+
+        let added = assert_recorded_create(&tv.vault, "zz-cli-added");
+        assert_eq!(added.value, "qq-added-value");
+        assert!(
+            (added.revision.wall_ms, added.revision.counter) > hwm_before,
+            "the create moves the high-water mark forward"
+        );
+    }
+
+    #[test]
+    fn add_step_with_an_existing_name_returns_ok_and_records_nothing() {
+        let mut tv = unlocked_vault();
+        add_item_to_vault(&mut tv.vault, &new_item("zz-cli-dup", "qq-first-value")).unwrap();
+        let first = listed(&tv.vault, "zz-cli-dup");
+        let hwm_before = tv.vault.high_water_mark().unwrap();
+
+        let result = add_item_to_vault(&mut tv.vault, &new_item("zz-cli-dup", "qq-second-value"));
+
+        assert!(result.is_ok(), "an existing name is reported, not returned as an error");
+        let items = tv.vault.list_items().unwrap();
+        assert_eq!(items.len(), 1, "no entry is added");
+        assert_eq!(items[0].uuid, first.uuid, "the existing entry keeps its UUID");
+        assert_eq!(
+            items[0].revision, first.revision,
+            "the existing entry keeps its revision"
+        );
+        assert_eq!(items[0].value, "qq-first-value", "the existing entry keeps its value");
+        assert_eq!(
+            tv.vault.high_water_mark().unwrap(),
+            hwm_before,
+            "the high-water mark is unchanged"
+        );
+        assert!(tv.vault.tombstones().unwrap().is_empty(), "nothing is deleted");
+    }
+
+    #[test]
+    fn update_step_records_an_edit() {
+        let mut tv = unlocked_vault();
+        tv.vault
+            .create_item(&NewItem {
+                name: "zz-cli-update".to_string(),
+                kind: ItemKind::Password,
+                value: "qq-old-value".to_string(),
+            })
+            .unwrap();
+        let before = listed(&tv.vault, "zz-cli-update");
+
+        update_item_value(&mut tv.vault, &before, "qq-New-value-9!", "zz-synthetic-vault", false).unwrap();
+
+        let after = assert_recorded_edit(&tv.vault, &before);
+        assert_eq!(after.value, "qq-New-value-9!", "the entry holds the new value");
+    }
+
+    #[test]
+    fn import_step_records_each_new_item_as_a_create_and_skips_existing_names() {
+        for skip_duplicates in [false, true] {
+            let mut tv = unlocked_vault();
+            tv.vault
+                .create_item(&new_item("zz-cli-present", "qq-present-value"))
+                .unwrap();
+            let present = listed(&tv.vault, "zz-cli-present");
+            let hwm_before = tv.vault.high_water_mark().unwrap();
+
+            let to_import = [
+                new_item("zz-cli-import-1", "qq-import-value-1"),
+                new_item("zz-cli-present", "qq-replacement-value"),
+                new_item("zz-cli-import-2", "qq-import-value-2"),
+                new_item("zz-cli-import-3", "qq-import-value-3"),
+            ];
+            let (imported, skipped) = import_new_items(&mut tv.vault, &to_import, skip_duplicates).unwrap();
+
+            assert_eq!((imported, skipped), (3, 1), "skip_duplicates = {skip_duplicates}");
+            let created = assert_recorded_creates(
+                &tv.vault,
+                &["zz-cli-import-1", "zz-cli-import-2", "zz-cli-import-3"],
+                hwm_before,
+            );
+            assert!(
+                created.iter().all(|i| i.uuid != present.uuid),
+                "imported entries get UUIDs of their own"
+            );
+            let kept = listed(&tv.vault, "zz-cli-present");
+            assert_eq!(kept.uuid, present.uuid, "the skipped entry keeps its UUID");
+            assert_eq!(kept.revision, present.revision, "the skipped entry keeps its revision");
+            assert_eq!(kept.value, "qq-present-value", "the skipped entry keeps its value");
+            assert_eq!(tv.vault.list_items().unwrap().len(), 4);
+        }
     }
 }

@@ -4,5 +4,6 @@ mod lock_clipboard;
 mod lock_timer;
 mod refresh_items;
 mod support;
+mod sync_recording;
 mod unlock;
 mod vault_selector;
