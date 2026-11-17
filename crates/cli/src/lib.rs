@@ -301,6 +301,7 @@ pub enum Commands {
 /// - IO errors while exporting or importing.
 /// - Validation errors during input or conflicts in item names.
 /// - Password generation errors for invalid configurations.
+/// - A failing backup subcommand: its error is returned, so `chamber backup ...` exits non-zero.
 ///
 /// # Panics
 ///
@@ -708,7 +709,7 @@ pub async fn handle_command(cmd: Commands) -> Result<()> {
 
         Commands::Backup(backup_cmd) => {
             let vault = Vault::open_or_create(None)?;
-            let _ = handle_backup_command(vault, backup_cmd);
+            handle_backup_command(vault, backup_cmd)?;
         }
         Commands::Registry(registry_cmd) => {
             let mut manager = VaultManager::new()?;
@@ -934,10 +935,15 @@ const fn get_type_emoji(item_type: ItemKind) -> &'static str {
     }
 }
 
+/// Writes exactly `prompt` to `sink`, with no added newline, and flushes it.
+fn write_prompt<W: Write>(sink: &mut W, prompt: &str) -> std::io::Result<()> {
+    sink.write_all(prompt.as_bytes())?;
+    sink.flush()
+}
+
+/// Asks for a secret: the prompt goes to standard error, and the secret is read without echo.
 fn prompt_secret(prompt: &str) -> Result<String> {
-    use std::io::{Write, stdout};
-    print!("{prompt}");
-    stdout().flush()?;
+    write_prompt(&mut std::io::stderr(), prompt)?;
     // Read without echo on Windows/Linux/macOS
     let pass = rpassword::prompt_password("")?;
     Ok(pass)
@@ -1224,6 +1230,31 @@ mod handle_command_tests {
 
     // The tests below drive the write steps behind the Add, Update, and Import commands on an
     // unlocked temp-directory vault, and check the synchronization state each write records.
+
+    #[test]
+    fn backup_dispatch_returns_restore_of_missing_file_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vault = Vault::open_or_create(Some(&dir.path().join("vault.db"))).unwrap();
+        let missing = dir.path().join("missing-backup.json");
+
+        let res = handle_backup_command(
+            vault,
+            BackupCommand::Restore {
+                backup_path: missing,
+                yes: true,
+            },
+        );
+
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("Backup file not found"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn write_prompt_writes_exactly_the_prompt() {
+        let mut sink: Vec<u8> = Vec::new();
+        write_prompt(&mut sink, "Enter master key: ").unwrap();
+        assert_eq!(sink, b"Enter master key: ");
+    }
 
     use crate::test_support::{
         assert_recorded_create, assert_recorded_creates, assert_recorded_edit, listed, new_item, unlocked_vault,
