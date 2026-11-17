@@ -109,6 +109,27 @@ fn is_candidate_name(name: &OsStr) -> bool {
     !bytes.starts_with(b".") && bytes.ends_with(SNAPSHOT_SUFFIX)
 }
 
+/// Renders a sync directory file name for a person to read: every character for which
+/// [`char::is_control`] is true becomes its [`char::escape_unicode`] form (lowercase hexadecimal,
+/// no padding, for example `\u{1b}` for ESC and `\u{a}` for a line feed). Every other character,
+/// backslashes included, is kept as it is.
+///
+/// File names in a sync directory are chosen by whoever can write there, so a name is rendered
+/// this way before it is shown to a person, keeping control characters such as terminal escape
+/// sequences from reaching the screen raw.
+#[must_use]
+pub fn display_file_name(name: &str) -> String {
+    let mut shown = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_control() {
+            shown.extend(c.escape_unicode());
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
+}
+
 // ---- Reports and errors ----
 
 /// What [`Vault::publish_snapshot`] wrote.
@@ -333,7 +354,7 @@ impl Vault {
     /// before any file is read); an error when the directory cannot be listed; and the database
     /// error when merging a file's state fails locally. In that last case that file's
     /// transaction is rolled back, files merged before it stay merged, and later files are not
-    /// processed.
+    /// processed; the error names the file, rendered through [`display_file_name`].
     pub fn merge_snapshots(&mut self, sync_dir: &Path) -> Result<MergeReport> {
         let (snapshot_key, vault_uuid) = self.snapshot_key()?;
         match fs::metadata(sync_dir) {
@@ -362,7 +383,7 @@ impl Vault {
                     let counts = self.merge_sync_state(&decoded.state).wrap_err_with(|| {
                         format!(
                             "Merging the snapshot file {} failed, so nothing from it was merged",
-                            candidate.file_name
+                            display_file_name(&candidate.file_name)
                         )
                     })?;
                     FileOutcome::Merged(counts)
@@ -1459,6 +1480,37 @@ mod tests {
         assert_eq!(r.value("github").as_deref(), Some("edited on b"));
         assert_eq!(r.value("aws"), None);
         assert!(r.vault.tombstones().unwrap().contains(&aws));
+    }
+
+    // Windows forbids control characters in file names.
+    #[cfg(unix)]
+    #[test]
+    fn a_merge_failure_names_the_file_with_control_characters_escaped() {
+        let (_root, [mut b, mut r]) = network::<2>();
+        b.add("poison", "refused");
+        b.publish();
+        let name = "evil\u{1b}[2J.chsnap";
+        deliver_as(&b, &r, name);
+
+        let raw = rusqlite::Connection::open(r.vault.db_path()).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER poison BEFORE INSERT ON items WHEN NEW.name = 'poison' \
+             BEGIN SELECT RAISE(ABORT, 'insert refused by test'); END;",
+        )
+        .unwrap();
+
+        let err = r.vault.merge_snapshots(&r.sync).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("evil\\u{1b}[2J.chsnap"), "{chain:?}");
+        assert!(!chain.chars().any(char::is_control), "{chain:?}");
+        assert_eq!(r.value("poison"), None);
+
+        raw.execute_batch("DROP TRIGGER poison;").unwrap();
+        let report = r.merge();
+        let merged: Vec<_> = report.merged().collect();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].0, name, "the report keeps the real file name");
+        assert_eq!(r.value("poison").as_deref(), Some("refused"));
     }
 
     // ---- Publication safety ----

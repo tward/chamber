@@ -15,6 +15,7 @@
 
 use crate::prompt_secret;
 use chamber_vault::enroll::{ENROLLMENT_EXTENSION, EnrollmentError, EnrollmentPackage, TransferSecret};
+use chamber_vault::sync_dir::display_file_name;
 use chamber_vault::{FileOutcome, MergeReport, PublishReport, SYNC_DIR_ENV, Vault, resolve_sync_dir};
 use clap::Subcommand;
 use color_eyre::Result;
@@ -204,22 +205,6 @@ fn write_merge_report<W: Write>(report: &MergeReport, sync_dir: &Path, out: &mut
         }
     }
     Ok(())
-}
-
-/// Renders a candidate file name for the terminal: every character for which
-/// [`char::is_control`] is true becomes its [`char::escape_unicode`] form (lowercase hexadecimal,
-/// no padding, for example `\u{1b}` for ESC and `\u{a}` for a line feed). Every other character,
-/// backslashes included, is kept as it is.
-fn display_file_name(name: &str) -> String {
-    let mut shown = String::with_capacity(name.len());
-    for c in name.chars() {
-        if c.is_control() {
-            shown.extend(c.escape_unicode());
-        } else {
-            shown.push(c);
-        }
-    }
-    shown
 }
 
 /// Writes the published file with its entry and tombstone counts and its snapshot ID, for
