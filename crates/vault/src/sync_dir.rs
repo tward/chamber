@@ -292,6 +292,9 @@ impl Vault {
         let encoded = encode_snapshot(&snapshot_key, vault_uuid, device_id, &state)?;
 
         ensure_directory(sync_dir)?;
+        // Checked again now that the directory exists: a path such as `missing/../vault` could
+        // not be resolved before it was created, and only now resolves to where it really points.
+        refuse_database_inside(sync_dir, &self.db_path)?;
         let temp_path = sync_dir.join(temp_file_name(device_id));
         write_temp_file(&temp_path, &encoded.bytes)?;
 
@@ -1215,6 +1218,30 @@ mod tests {
                 .join(snapshot_file_name(a.device_id()))
                 .exists()
         );
+    }
+
+    #[test]
+    fn publishing_through_a_missing_directory_into_the_database_directory_is_refused() {
+        let (root, [a]) = network::<1>();
+        let vault_dir = root.path().join("vault-0");
+        // Does not resolve until `missing` is created, then resolves to the database's directory.
+        let sync = root.path().join("missing").join("..").join("vault-0");
+
+        let err = a.vault.publish_snapshot(&sync).unwrap_err();
+        assert!(
+            matches!(sync_dir_error(&err), SyncDirError::ContainsDatabase { .. }),
+            "{err:#}"
+        );
+
+        let written: Vec<_> = fs::read_dir(&vault_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("chsnap") || ext.eq_ignore_ascii_case("tmp"))
+            })
+            .collect();
+        assert!(written.is_empty(), "written beside the database: {written:?}");
     }
 
     #[test]
