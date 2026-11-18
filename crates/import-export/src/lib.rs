@@ -752,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn test_export_to_readonly_directory() {
+    fn test_export_to_path_that_is_a_directory() {
         // Export to a path that is an existing directory rather than a file
         let dir = tempfile::TempDir::new().unwrap();
         let dir_as_file = dir.path().join("not_a_file");
