@@ -16,7 +16,7 @@ managing passwords, API keys, certificates, database credentials,
 and other secrets with strong cryptographic guarantees.
 ### ✨ Features
 - **🔐 Strong Encryption**: ChaCha20-Poly1305 authenticated encryption with Argon2 key derivation
-- **💾 SQLite Backend**: Reliable, ACID-compliant storage with WAL mode and foreign key constraints
+- **💾 SQLite Backend**: Reliable, ACID-compliant storage with WAL mode and foreign key enforcement switched on (no table declares a foreign key)
 - **📱 Terminal UI**: Beautiful, responsive interface built with Ratatui and Crossterm
 - **📊 Multiple Export Formats**: JSON, CSV, and Chamber Backup formats with robust parsing
 - **🔄 Backup**: a comprehensive backup system that ensures your sensitive data is automatically protected
@@ -895,7 +895,7 @@ graph TB
   - `tombstones`: Holds the UUIDs of deleted entries
   - `sync_meta`: Holds the vault UUID, the device ID, and the revision high-water mark
 
-- **Features**: ACID transactions, foreign key constraints, automatic migrations
+- **Features**: ACID transactions, foreign key enforcement switched on (no table declares a foreign key), automatic migrations
 
 #### Terminal UI (`crates/tui`)
 - **Framework**: Ratatui for cross-platform terminal interfaces
